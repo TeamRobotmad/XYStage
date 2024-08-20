@@ -61,7 +61,7 @@ class HexDriveApp(app.App):
         # LS Pins
         self._power_detect  = self.config.ls_pin[_DETECT_PIN]
         self._power_control = self.config.ls_pin[_ENABLE_PIN]
-        self._endstop       = self.config.ls_pin[_ENDSTOP_PIN]  # For Stepper Motor
+        self._endstop       = self.config.ls_pin[_ENDSTOP_PIN]  # For Stepper Motor mounted on linear rail with endstop switch
 
         self._servo_centre = [_SERVO_CENTRE] * 4
         eventbus.on_async(RequestStopAppEvent, self._handle_stop_app, self)
@@ -376,7 +376,7 @@ class HexDriveApp(app.App):
         return pwm
 
 ## Stepper Motor Support
-    # Stepper Motor Support
+    # Stepper Motor Support - force output to a specific phase
     def motor_step(self, phase: int) -> bool:
         if phase >= _STEPPER_NUM_PHASES:
             return None
@@ -384,12 +384,12 @@ class HexDriveApp(app.App):
             # not currently configured for stepper motor - configure
             self._pwm_deinit() 
             self._stepper = True
-        # if we have reached the endstop then stop
-        # we are assuming that the endstop is active low 
         for channel, value in enumerate(self._step[phase]):
             self.config.pin[channel].value(value)
         self._outputs_energised = True  
         self._time_since_last_update = 0
+        # check if we have reached the endstop
+        # we are assuming that the endstop is active low         
         if not self._endstop.value():
             return False                   
         return True
