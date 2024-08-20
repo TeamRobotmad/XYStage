@@ -612,8 +612,9 @@ class BadgeBotApp(app.App):
 
     def find_hexdrive_app(self, port: int) -> app:                    
         for an_app in scheduler.apps:
-            if hasattr(an_app, "config") and hasattr(an_app.config, "port") and  an_app.config.port == port:
-                return an_app
+            if type(an_app).__name__ is 'HexDriveApp':
+                if hasattr(an_app, "config") and hasattr(an_app.config, "port") and  an_app.config.port == port:
+                    return an_app
         return None
 
 
