@@ -84,12 +84,12 @@ _SERVO_MAX_TRIM        = 1000       # us
 _MAX_SERVO_RANGE       = 1400       # 1400us either side of centre (VERY WIDE)
 
 # Stepper Tester - Defaults
-_STEPPER_MAX_SPEED     = 1000       # full steps per second
-_STEPPER_MAX_POSITION  = 6200       # half steps
+_STEPPER_MAX_SPEED     = 200        # full steps per second
+_STEPPER_MAX_POSITION  = 3100       # full steps from h/w endstop to s/w endstop at the other end
 _STEPPER_DEFAULT_SPEED = 50         # full steps per second
 _STEPPER_NUM_PHASES    = 8          # half steps
-_STEPPER_DEFAULT_SPR   = 200        # steps per revolution
-
+_STEPPER_DEFAULT_SPR   = 200        # full steps per revolution
+_STEPPER_DEFAULT_STEP  = 1          # half steps, (2 = full steps)
 
 # Timings
 _TICK_MS       =  10        # Smallest unit of change for power, in ms
@@ -211,13 +211,13 @@ class BadgeBotApp(app.App):
         self.is_scroll: bool = False
         self.scroll_offset: int = 0
         self.notification: Notification = None
-        self.error_message = [str]
+        self.error_message = []
         self.current_menu: str = None
         self.menu: Menu = None
 
         # BadgeBot Control Sequence Variables
         self.run_countdown_elapsed_ms: int = 0
-        self.instructions = [Instruction]
+        self.instructions = []
         self.current_instruction: Instruction = None
         self.current_power_duration = ((0,0,0,0), 0)
         self.power_plan_iter = iter([])
@@ -281,7 +281,7 @@ class BadgeBotApp(app.App):
 
         # Servo Tester
         self._time_since_last_input: int = 0
-        self._timeout_period: int = 60000                      # ms        
+        self._timeout_period: int = 120000                     # ms (2 minutes - without any user input)       
         self._time_since_last_update: int = 0
         self._keep_alive_period: int = 500                     # ms (half the value used in hexdrive.py)  
         self.num_servos: int     = 4                           # Default assumed for a single HexDrive
@@ -289,13 +289,13 @@ class BadgeBotApp(app.App):
         self.servo_centre        = [_SERVO_DEFAULT_CENTRE]*4   # Trim Servo Centre
         self.servo_range         = [_SERVO_DEFAULT_RANGE]*4    # Limit Servo Range
         self.servo_rate          = [_SERVO_DEFAULT_RATE]*4     # Servo Rate of Change
-        self.servo_mode          = [ServoMode()]*4               # Servo Mode
+        self.servo_mode          = [ServoMode()]*4             # Servo Mode
         self.servo_selected: int = 0
 
         # Overall app state (controls what is displayed and what user inputs are accepted)
         self.current_state = STATE_INIT
         self.previous_state = self.current_state
-
+        self._update_period = 50  # ms
 
         eventbus.on_async(RequestForegroundPushEvent, self._gain_focus, self)
         eventbus.on_async(RequestForegroundPopEvent, self._lose_focus, self)
@@ -367,8 +367,7 @@ class BadgeBotApp(app.App):
             cur_time = time.ticks_ms()
             delta_ticks = time.ticks_diff(cur_time, last_time)
             self.background_update(delta_ticks)
-            s = 10 if self.current_state == STATE_RUN else 50
-            await asyncio.sleep_ms(s)
+            await asyncio.sleep_ms(self._update_period)
             last_time = cur_time
 
 
@@ -376,9 +375,11 @@ class BadgeBotApp(app.App):
 
     def background_update(self, delta: int):
         if self.current_state == STATE_RUN:
+            # DC Motor Contorl
             output = self.get_current_power_level(delta)
             if output is None:
                 self.current_state = STATE_DONE
+                self._update_period = 50
             elif self.hexdrive_app is not None:
                 self.hexdrive_app.set_motors(output)
 
@@ -1115,6 +1116,7 @@ class BadgeBotApp(app.App):
             if self.hexdrive_app is not None:
                 self.hexdrive_app.set_power(True)
             self.current_state = STATE_RUN
+            self._update_period = 10
 
 
     def _update_state_done(self, delta: int):
@@ -1131,7 +1133,7 @@ class BadgeBotApp(app.App):
             self.current_power_duration = ((0,0,0,0), 0)
             self.current_state = STATE_COUNTDOWN
 
-    # Servo Tester:
+    # Stepper Tester:
     def _update_state_stepper(self, delta: int):
         # Left/Right to adjust position
         if self.button_states.get(BUTTON_TYPES["RIGHT"]):
@@ -1143,10 +1145,9 @@ class BadgeBotApp(app.App):
                         speed = _STEPPER_MAX_SPEED
                     self._stepper.speed(speed)
                 else:
-                    if self.stepper_mode != StepperMode.POSITION:                  # Position Mode
+                    if self.stepper_mode != StepperMode.POSITION:               # Position Mode
                         self.stepper_mode.set(StepperMode.POSITION)
                         self._stepper.speed(_STEPPER_DEFAULT_SPEED)
-                        self._stepper.enable(True)
                         self._stepper.track_target()
                     pos = self._stepper.get_pos()
                     pos = self._inc(pos, self._auto_repeat_level+1)
@@ -1160,11 +1161,10 @@ class BadgeBotApp(app.App):
                     if -_STEPPER_MAX_SPEED > speed:
                         speed = -_STEPPER_MAX_SPEED
                     self._stepper.speed(speed)  
-                else:                                           # Position Mode
+                else:                                                           # Position Mode
                     if self.stepper_mode != StepperMode.POSITION:
                         self.stepper_mode.set(StepperMode.POSITION)
                         self._stepper.speed(_STEPPER_DEFAULT_SPEED)
-                        self._stepper.enable(True)
                         self._stepper.track_target()
                     pos = self._stepper.get_pos()
                     pos = self._dec(pos, self._auto_repeat_level+1)
@@ -1176,7 +1176,7 @@ class BadgeBotApp(app.App):
             if self.button_states.get(BUTTON_TYPES["CANCEL"]):
                 self.button_states.clear()
                 if self.hexdrive_app is not None:
-                    self._stepper.stop()
+                    self._stepper.enable(False)
                 self.current_state = STATE_MENU
                 return
             elif self.button_states.get(BUTTON_TYPES["CONFIRM"]): #Cycle Through Modes
@@ -1184,15 +1184,13 @@ class BadgeBotApp(app.App):
                 self.stepper_mode.inc()
                 if self.stepper_mode == StepperMode.POSITION:      # Position Mode
                     self._stepper.speed(_STEPPER_DEFAULT_SPEED)
-                    self._stepper.enable(True)
                     self._stepper.target(self._stepper.get_pos())
                     self._stepper.track_target()
-                elif self.stepper_mode == StepperMode.SPEED:    # Speed Mode
-                    self._stepper.enable(True)
+                elif self.stepper_mode == StepperMode.SPEED:        # Speed Mode
                     self._stepper.speed(0)
                     self._stepper.free_run(1)
-                else:                           # Off
-                    self._stepper.enable(False)
+                else:                                               # Off
+                    self._stepper.stop()
                 self._refresh = True
                 self.notification = Notification(f"  Stepper:\n {self.stepper_mode}")
                 print(f"Stepper:{self.stepper_mode}")
@@ -1202,8 +1200,11 @@ class BadgeBotApp(app.App):
             self._time_since_last_input += delta                
             if self._time_since_last_input > self._timeout_period:
                 self._stepper.stop()
+                self._stepper.speed(0)
+                self._stepper.enable(False)
                 self.current_state = STATE_MENU
-                self.notification = Notification("  Stepper:\n Timeout")            
+                self.notification = Notification("  Stepper:\n Timeout")
+                print("Stepper:Timeout")            
             elif self.stepper_mode == StepperMode.SPEED:    # Speed Mode
                 self._refresh = True
         self._time_since_last_update += delta
@@ -1516,11 +1517,11 @@ class BadgeBotApp(app.App):
             background_colour = (0.15,0.15,0.15)                        
             ctx.rgb(*background_colour).rectangle(-100,1,200,label_font_size-2).fill() 
             c = 0
-            # draw the stepper position
-            x = 100 * (self._stepper.get_pos() / self._settings['step_max_pos'].v)
-            # vertical bar at servo position
+            # draw the stepper position (based on a centre halfway through the range)
+            x = 200 * (self._stepper.get_pos() / self._settings['step_max_pos'].v) - 100
+            # vertical bar at stepper position
             ctx.rgb(*bar_colour).rectangle(x-2,1,5,label_font_size-2).fill()
-            # horizontal bar from 0 to servo position, not covering the centre marker or the servo position bar
+            # horizontal bar from 0 to stepper position, not covering the centre marker or the stepper position bar
             ctx.rgb(*body_colour)                        
             if   x > (c+4):
                 ctx.rectangle(c+1, 3, x-c-4, label_font_size-6).fill()
@@ -1735,7 +1736,7 @@ class BadgeBotApp(app.App):
                     # try timer IDs 0-3 until one is free
                     for i in range(4):
                         try: 
-                            self._stepper = Stepper(self.hexdrive_app, timer_id=i, max_pos=self._settings['step_max_pos'].v)
+                            self._stepper = Stepper(self, self.hexdrive_app, step_size=1, timer_id=i, max_pos=self._settings['step_max_pos'].v)
                             break
                         except:
                             pass
@@ -1744,9 +1745,11 @@ class BadgeBotApp(app.App):
                 else:
                     self.set_menu(None)
                     self.button_states.clear()                    
-                    self.current_state = STATE_STEPPER
+                    self.current_state = STATE_STEPPER 
                     self._refresh = True
-                    self._auto_repeat_clear()                
+                    self._auto_repeat_clear()
+                    self._stepper.enable(True)
+                    self._time_since_last_input = 0                                       
         elif item == _main_menu_items[2]: # Servo Test
             if self.num_servos == 0:
                 self.notification = Notification("No Servos")
@@ -1895,24 +1898,36 @@ class BadgeBotApp(app.App):
 ######## STEPPER MOTOR CLASS ########
 
 class Stepper:
-    def __init__(self, hexdrive_app, steps_per_rev: int = _STEPPER_DEFAULT_SPR, speed_sps: int = _STEPPER_DEFAULT_SPEED, max_sps: int = _STEPPER_MAX_SPEED, max_pos: int = _STEPPER_MAX_POSITION, timer_id: int = 0):
+    def __init__(self, container, hexdrive_app, step_size: int = 1, steps_per_rev: int = _STEPPER_DEFAULT_SPR, speed_sps: int = _STEPPER_DEFAULT_SPEED, max_sps: int = _STEPPER_MAX_SPEED, max_pos: int = _STEPPER_MAX_POSITION, timer_id: int = 0):
+        self._container = container 
         self._hexdrive_app = hexdrive_app
         self._phase = 0
         self._calibrated = False
-        self._timer = Timer(timer_id)   
-        self._timer_is_running=False
-        self._free_run_mode=0   # direction of free run mode
-        self._enabled=False
+        self._timer = Timer(timer_id)
+        self._timer_is_running = False
+        self._timer_mode = 0
+        self._free_run_mode = 0                     # direction of free run mode
+        self._enabled = False
         self._target_pos = 0
-        self._pos = 0
-        self._max_sps = int(max_sps)
-        self._steps_per_sec = int(speed_sps)
+        self._pos = 0                               # current position in half steps
+        self._max_sps = int(max_sps)                # max speed in full steps per second
+        self._steps_per_sec = int(speed_sps)        # current speed in full steps per second
         self._steps_per_rev = int(steps_per_rev)    # full steps per revolution
-        self._max_pos = int(max_pos)
+        self._max_pos = 2*int(max_pos)              # max position stored in half steps
         self._freq = 0
+        self._min_period = 0
+        self._step_size = int(step_size)            # 1 = half steps, 2 = full steps
+        self._last_step_time = 0    
         self.track_target()
         
-    def speed(self,sps):
+    def step_size(self,sz=1):
+        if sz < 1:
+            sz = 1
+        elif sz > 2:
+            sz = 2
+        self._step_size = int(sz)
+
+    def speed(self,sps):    # speed in FULL steps per second
         if self._free_run_mode == 1 and sps < 0:
             self._free_run_mode = -1
         elif self._free_run_mode == -1 and sps > 0:
@@ -1922,7 +1937,7 @@ class Stepper:
         elif sps < -self._max_sps:
             sps = -self._max_sps
         self._steps_per_sec = int(sps)
-        self._update_timer(2*abs(self._steps_per_sec))    # half steps per second
+        self._update_timer((2//self._step_size)*abs(self._steps_per_sec))    # steps per second
 
     def speed_rps(self,rps):
         self.speed(rps*self._steps_per_rev)
@@ -1931,56 +1946,68 @@ class Stepper:
         return self._steps_per_sec
 
     def target(self,t):
-        self._target_pos = int(t)
+        if self._calibrated and t < 0:
+            # when already calibrated limit to 0
+            self._target_pos = 0
+        elif self._calibrated and (2*int(t)) > self._max_pos:
+            # when already calibrated limit to max
+            self._target_pos = self._max_pos
+        else:
+            self._target_pos = 2*int(t)
 
     def target_deg(self,deg):
-        self.target(self._steps_per_rev*deg/180.0)  # target pos is in half steps
+        self.target(self._steps_per_rev*deg/360.0)  # target pos is in steps
     
     def target_rad(self,rad):
-        self.target(self._steps_per_rev*rad/pi)     # target pos is in half steps
+        self.target(self._steps_per_rev*rad/(2*pi)) # target pos is in steps
     
     def get_pos(self) -> int:
-        return self._pos
+        return (self._pos//2)   # convert half steps to full steps
     
     def get_pos_deg(self) -> float:
-        return self.get_pos()*180.0/self._steps_per_rev # half steps to degrees
+        return self._pos*180.0/self._steps_per_rev      # half steps to degrees
     
     def get_pos_rad(self) -> float:
-        return self.get_pos()*pi/self._steps_per_rev    # half steps to radians
+        return self._pos*pi/self._steps_per_rev         # half steps to radians
     
     def overwrite_pos(self,p=0):
-        self._pos = int(p)
+        self._pos = 2*int(p)    # convert full steps to half steps
     
     def overwrite_pos_deg(self,deg):
-        self.overwrite_pos(deg*self._steps_per_rev/180.0)   # degrees to half steps
+        self._pos = deg*self._steps_per_rev/180.0      # degrees to half steps
     
     def overwrite_pos_rad(self,rad):
-        self.overwrite_pos(rad*self._steps_per_rev/pi)      # radians to half steps
+        self._pos = rad*self._steps_per_rev/pi         # radians to half steps
 
     def step(self,d=0):
-        if self._enabled:
-            if d>0:
-                self._pos+=1
-            elif d<0:
-                self._pos-=1
-            # Check position limits
-            if self._calibrated and self._pos < 0:
-                self._pos = 0
-                return
-            elif self._calibrated and self._pos > self._max_pos:
-                self._pos = self._max_pos
-                return
-            elif d>0:
-                self._phase = (self._phase-1)%_STEPPER_NUM_PHASES
-            elif d<0:
-                self._phase = (self._phase+1)%_STEPPER_NUM_PHASES
-            #print(f"p:{self._pos}")
-            try:
-                if not self._hexdrive_app.motor_step(self._phase):
-                    # we have reached the endstop
-                    self._hit_endstop()
-            except Exception as e:                       
-                print(f"step phase {self._phase} failed:{e}")
+        cur_time = time.ticks_ms()
+        if time.ticks_diff(cur_time, self._last_step_time) < self._min_period:
+            # avoid stepping too quickly as this causes skipped steps
+            return
+        self._last_step_time = cur_time
+        if d>0:
+            self._pos+=self._step_size
+            self._phase = (self._phase-self._step_size)%_STEPPER_NUM_PHASES
+        elif d<0:
+            self._pos-=self._step_size
+            self._phase = (self._phase+self._step_size)%_STEPPER_NUM_PHASES
+        # Check position limits
+        if self._calibrated and self._pos < 0:
+            print("s/w min endstop")
+            self._pos = 0
+            self.speed(0)
+            return
+        elif self._calibrated and self._pos > self._max_pos:
+            print("s/w max endstop")
+            self._pos = self._max_pos
+            self.speed(0)
+            return
+        try:
+            if not self._hexdrive_app.motor_step(self._phase):
+                # we have reached the endstop
+                self._hit_endstop()
+        except Exception as e:                       
+            print(f"step phase {self._phase} failed:{e}")
 
     def _hit_endstop(self):             
         print("Endstop - hit")
@@ -1988,26 +2015,32 @@ class Stepper:
             self._calibrated = True
         # set this as the new zero position
         self.overwrite_pos(0)
-        self.speed(0)
+        # if we were moving towards the endstop, stop
+        if self._free_run_mode < 0:
+            self.speed(0)
+        elif self._free_run_mode == 0 and self._target_pos < self._pos:
+            self.speed(0)
+
+    def _timer_callback_fwd(self,t):
+        self.step(1)
+
+    def _timer_callback_rev(self,t):
+        self.step(-1)
 
     def _timer_callback(self,t):
-        if self._free_run_mode>0:
-            self.step(1)
-        elif self._free_run_mode<0:
-            self.step(-1)
-        elif self._target_pos>self._pos:
+        if self._target_pos>self._pos:
             self.step(1)
         elif self._target_pos<self._pos:
             self.step(-1)
-    
+
     def free_run(self,d=1):
         self._free_run_mode=d
         if d!=0:
-            self._update_timer(2*abs(self._steps_per_sec))   # half steps per second
+            self._update_timer((2//self._step_size)*abs(self._steps_per_sec))   # half steps per second
 
     def track_target(self):
         self._free_run_mode=0
-        self._update_timer(2*abs(self._steps_per_sec))      # half steps per second
+        self._update_timer((2//self._step_size)*abs(self._steps_per_sec))      # half steps per second
 
     def _update_timer(self,freq):
         if self._timer_is_running and freq != self._freq:
@@ -2017,17 +2050,26 @@ class Stepper:
                 self._timer_is_running=False
             except Exception as e:
                 print(f"update_timer failed:{e}")
-        if 0 != freq and freq != self._freq:
+        if 0 != freq and (freq != self._freq or self._free_run_mode != self._timer_mode):
             try:                
                 print(f"Timer: {freq}Hz")
-                self._timer.init(freq=freq,callback=self._timer_callback)
+                if self._free_run_mode>0:
+                    self._timer.init(freq=freq,callback=self._timer_callback_fwd)
+                elif self._free_run_mode<0:
+                    self._timer.init(freq=freq,callback=self._timer_callback_rev)
+                else:
+                    self._timer.init(freq=freq,callback=self._timer_callback)
                 self._freq = freq
+                self._min_period = (1000//freq) - 1
                 self._timer_is_running=True
+                self._timer_mode = self._free_run_mode
             except Exception as e:
-                print(f"update_timer failed:{e}")        
+                print(f"update_timer failed:{e}")
+        elif freq == 0:
+            print("Timer: 0Hz")
+
 
     def stop(self):
-        self._free_run_mode=0
         self._update_timer(0)
         try:
             self._hexdrive_app.motor_release()
@@ -2038,13 +2080,15 @@ class Stepper:
         self._enabled=e
         try:
             if e:
+                if self._free_run_mode!=0:
+                    self._update_timer((2//self._step_size)*abs(self._steps_per_sec))   # half steps per second                
                 self._hexdrive_app.motor_step(self._phase)
             else:
+                self._update_timer(0)
                 self._hexdrive_app.motor_release()
             self._hexdrive_app.set_power(e)
         except Exception as e:
             print(f"enable failed:{e}")
-
 
     def is_enabled(self) -> bool:
         return self._enabled

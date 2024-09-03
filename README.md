@@ -129,7 +129,7 @@ The first two Channels take up signals that would otherwise control Motor 1 and 
 You can use one motor and 1 or 2 servos simultaneously.
 
 ### Stepper Motor
-You can control a single 2 phase stepper motor using ```motor_step()``` specifying which of the 8 possible phases to output in the range 0 to 7.  There are 8 possible values as half stepping is supported. To use only full steps specify phase values of 0, 2, 4 and 6.  Information on the pros and cons of using full or half stepping can be found online and what is right for you will depend on your motor and the application.  The motor can be released (so that it is not takign power to hold it in a fixed position) using ```motor_release()```.
+You can control a single 2 phase stepper motor using ```motor_step()``` specifying which of the 8 possible phases to output in the range 0 to 7.  There are 8 possible values as half stepping is supported. To use only full steps specify phase values of 0, 2, 4 and 6.  Information on the pros and cons of using full or half stepping can be found online and what is right for you will depend on your motor and the application.  The motor can be released (so that it is not taking power to hold it in a fixed position) using ```motor_release()```.
 
 ### Developers setup
 This is to help develop the BadgeBot application
