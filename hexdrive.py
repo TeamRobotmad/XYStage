@@ -144,11 +144,12 @@ class HexDriveApp(app.App):
                     print(f"H:{self.config.port}:Timeout")                  
             if self._pwm_setup:
                 for channel,pwm in enumerate(self.PWMOutput):
-                    if self.PWMOutput[channel] is not None:
+                    if pwm is not None:
                         try:
-                            self.PWMOutput[channel].duty_u16(0)
+                            pwm.duty_u16(0)
                         except Exception as e:
-                            print(f"H:{self.config.port}:PWM[{pwm}]:Off failed {e}")
+                            print(f"H:{self.config.port}:PWM[{channel}]:Off failed {e}")
+                            self.PWMOutput[channel] = None  # Tidy Up
             elif self._stepper:
                 self.motor_release()
       
@@ -217,7 +218,7 @@ class HexDriveApp(app.App):
         if not self._pwm_setup:
             return False
         for this_channel, pwm in enumerate(self.PWMOutput):
-            if channel is None or this_channel == channel:
+            if (channel is None or this_channel == channel) and pwm is not None:
                 try:
                     pwm.freq(int(freq))
                     if self._logging:
@@ -255,24 +256,26 @@ class HexDriveApp(app.App):
             # position == None -> Turn off PWM (some servos will then turn off, others will stay in last position)
             if channel is None:
                 # channel == None -> Turn off all PWM outputs
-                for channel in self.PWMOutput:
-                    try:
-                        channel.duty_ns(0)
-                    except:
-                        pass
+                for channel, pwm in enumerate(self.PWMOutput):
+                    if pwm is not None:
+                        try:
+                            pwm.duty_ns(0)
+                        except:
+                            pass
                 if self._logging:
                     print(f"H:{self.config.port}:PWM:[All]:Off")
                 self._outputs_energised = False
                 return True
             elif channel < 0 or channel >= 4:
                 return False
-            try:
-                self.PWMOutput[channel].duty_ns(0)
-                if self._logging:
-                    print(f"H:{self.config.port}:PWM[{channel}]:Off")
-            except Exception as e:
-                print(f"H:{self.config.port}:PWM[{channel}]:Off failed {e}")
-                return False
+            else:
+                try:
+                    self.PWMOutput[channel].duty_ns(0)
+                    if self._logging:
+                        print(f"H:{self.config.port}:PWM[{channel}]:Off")
+                except Exception as e:
+                    print(f"H:{self.config.port}:PWM[{channel}]:Off failed {e}")
+                    return False
             # check if all channels are now off and set outputs_energised accordingly
             self._check_outputs_energised()          
         else:           
@@ -331,20 +334,31 @@ class HexDriveApp(app.App):
         for motor, output in enumerate(outputs):
             if abs(output) > 65535:
                 return False
-            if output >= 0:
-                if 0 > self._motor_output[motor]:
-                    # switch which signal is being driven as the PWM output
-                    self.PWMOutput[(motor<<1)+1].deinit()
-                    self.config.pin[(motor<<1)+1].value(0)
-                    self.PWMOutput[(motor<<1)] = PWM(self.config.pin[(motor<<1)], freq = self._freq[(motor<<1)], duty_u16 = int(output))
-                self._set_pwmoutput((motor<<1), int(output))
-            else:
-                if 0 <= self._motor_output[motor]:
-                    # switch which signal is being driven as the PWM output
-                    self.PWMOutput[(motor<<1)].deinit()
-                    self.config.pin[(motor<<1)].value(0)
-                    self.PWMOutput[(motor<<1)+1] = PWM(self.config.pin[(motor<<1)+1], freq = self._freq[(motor<<1)], duty_u16 = -int(output))
-                self._set_pwmoutput((motor<<1)+1, -int(output))    
+            try:
+                if output >= 0:
+                    if 0 > self._motor_output[motor]:
+                        # switch which signal is being driven as the PWM output
+                        self.PWMOutput[(motor<<1)+1].deinit()
+                        self.PWMOutput[(motor<<1)+1] = None
+                        self.config.pin[(motor<<1)+1].value(0)
+                        self.PWMOutput[(motor<<1)] = PWM(self.config.pin[(motor<<1)], freq = self._freq[(motor<<1)], duty_u16 = int(output))
+                        if self._logging:
+                            print(f"H:{self.config.port}:<>PWM[{(motor<<1)}]:{output}")                      
+                    else:
+                        self._set_pwmoutput((motor<<1), int(output))                  
+                else:
+                    if 0 <= self._motor_output[motor]:
+                        # switch which signal is being driven as the PWM output
+                        self.PWMOutput[(motor<<1)].deinit()
+                        self.PWMOutput[(motor<<1)] = None
+                        self.config.pin[(motor<<1)].value(0)
+                        self.PWMOutput[(motor<<1)+1] = PWM(self.config.pin[(motor<<1)+1], freq = self._freq[(motor<<1)], duty_u16 = -int(output))
+                        if self._logging:
+                            print(f"H:{self.config.port}:<>PWM[{(motor<<1)+1}]:{-int(output)}")                            
+                    else:        
+                        self._set_pwmoutput((motor<<1)+1, -int(output))
+            except Exception as e:
+                print(f"H:{self.config.port}:Motor{motor}:{output} set failed {e}")    
             self._motor_output[motor] = output
         self._check_outputs_energised()
         self._time_since_last_update = 0
@@ -443,10 +457,10 @@ class HexDriveApp(app.App):
 
     # De-initialise all PWM outputs
     def _pwm_deinit(self):
-        for channel, _ in enumerate(self.PWMOutput):
-            if self.PWMOutput[channel] is not None:
+        for channel, pwm in enumerate(self.PWMOutput):
+            if pwm is not None:
                 try:
-                    self.PWMOutput[channel].deinit()    
+                    pwm.deinit()    
                 except:
                     pass
                 self.PWMOutput[channel] = None
@@ -458,14 +472,14 @@ class HexDriveApp(app.App):
     # are any of the PWM outputs energised?
     def _check_outputs_energised(self):
         energised_output = False
-        for channel in self.PWMOutput:
-            try:
-                if 0 < channel.duty_ns():
-                    energised_output = True
-                    break
-            except Exception as e:
-                print(f"H:{self.config.port}:PWM:Check failed {e}")
-                pass
+        for channel, pwm in enumerate(self.PWMOutput):
+            if pwm is not None:
+                try:
+                    if 0 < pwm.duty_ns():
+                        energised_output = True
+                        break
+                except Exception as e:
+                    print(f"H:{self.config.port}:PWM[{channel}]:Check failed {e}")
         if self._outputs_energised != energised_output:
             if self._logging:
                 print(f"H:{self.config.port}:Outputs {'Energised' if energised_output else 'De-energised'}")
