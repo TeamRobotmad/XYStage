@@ -12,18 +12,14 @@ from app_components.tokens import label_font_size, twentyfour_pt, clear_backgrou
 from app_components import Menu
 from events.input import BUTTON_TYPES, Button, Buttons, ButtonUpEvent
 from frontboards.twentyfour import BUTTONS
-from machine import I2C, Timer, Pin
+from machine import PWM, Timer, Pin
 from system.eventbus import eventbus
 from system.hexpansion.events import (HexpansionInsertionEvent,
                                       HexpansionRemovalEvent)
-from system.hexpansion.header import HexpansionHeader, write_header, read_header
-from system.hexpansion.util import get_hexpansion_block_devices
+from system.hexpansion.header import read_header
 from system.hexpansion.config import HexpansionConfig
-from system.patterndisplay.events import PatternDisable, PatternEnable
 from system.scheduler import scheduler
-from system.scheduler.events import (RequestForegroundPopEvent,
-                                     RequestForegroundPushEvent,
-                                     RequestStopAppEvent)
+from system.scheduler.events import (RequestStopAppEvent)
 
 from tildagonos import tildagonos
 
@@ -51,11 +47,11 @@ _APP_VERSION = "1.0" # BadgeBot App Version Number
 
 
 # Stepper Tester - Defaults
-_STEPPER_MAX_SPEED     = 200        # full steps per second
+_STEPPER_MAX_SPEED     = 5000       # full steps per second (X)
+_STEPPER_MIN_SPEED     = 200        # full steps per second (X)
 _STEPPER_MAX_POSITION  = 3100       # full steps from h/w endstop to s/w endstop at the other end
-_STEPPER_DEFAULT_SPEED = 50         # full steps per second
+_STEPPER_DEFAULT_SPEED = 200        # full steps per second (Y)
 _STEPPER_NUM_PHASES    = 8          # half steps
-_STEPPER_DEFAULT_STEP  = 1          # half steps, (2 = full steps)
 
 # Timings
 _AUTO_REPEAT_MS = 200       # Time between auto-repeats, in ms
@@ -77,10 +73,8 @@ STATE_SETTINGS = 5       # Edit Settings
 _MINIMISE_VALID_STATES = [0, 1, 3, 4, 5]
 
 # HexDrive Hexpansion constants
-_EEPROM_ADDR  = 0x50
 _EEPROM_NUM_ADDRESS_BYTES = 2
-_EEPROM_PAGE_SIZE = 32
-_EEPROM_TOTAL_SIZE = 64 * 1024 // 8
+
 
 # HexDrive used for Y - Drive (autodetected)
 
@@ -95,9 +89,9 @@ X_STEP = 3  # hs pin (HSI)
 
 _USABLE_X_PIXELS =  200
 _USABLE_Y_PIXELS =  150
-_WIDTH_DEFAULT   = 2000
+_WIDTH_DEFAULT   = (1000*32)
 _HEIGHT_DEFAULT  = 3000
-_XRANGE_DEFAULT  = 1940 # Driver configured for half steps
+_XRANGE_DEFAULT  = (970*32) # Driver configured for 1/32 steps
 _YRANGE_DEFAULT  = 3100
 
 
@@ -129,10 +123,12 @@ class XYStageApp(app.App):
         # Settings
         self._settings = {}
         self._settings['logging']       = MySetting(self._settings, _LOGGING, False, True)
-        self._settings['width']         = MySetting(self._settings, _WIDTH_DEFAULT,  100, 10000)
-        self._settings['height']        = MySetting(self._settings, _HEIGHT_DEFAULT, 100, 10000)
-        self._settings['XRange']        = MySetting(self._settings, _XRANGE_DEFAULT, 100, 10000)
-        self._settings['YRange']        = MySetting(self._settings, _YRANGE_DEFAULT, 100, 10000)
+        self._settings['width']         = MySetting(self._settings, _WIDTH_DEFAULT,  10, 100000)
+        self._settings['height']        = MySetting(self._settings, _HEIGHT_DEFAULT, 10, 100000)
+        self._settings['XRange']        = MySetting(self._settings, _XRANGE_DEFAULT, 10, 100000)
+        self._settings['YRange']        = MySetting(self._settings, _YRANGE_DEFAULT, 10, 100000)
+        self._settings['min_speed']     = MySetting(self._settings, _STEPPER_MIN_SPEED, 10, 10000)
+        self._settings['max_speed']     = MySetting(self._settings, _STEPPER_MAX_SPEED, 10, 100000)
 
         self._edit_setting: int  = None
         self._edit_setting_value = None       
@@ -262,7 +258,6 @@ class XYStageApp(app.App):
                 self.hexdrive_app = self.find_hexdrive_app(self.hexdrive_port)
                 self.current_state = STATE_MENU
         
-        # manage PatternEnable/Disable for all states
         self._update_main_application(delta)
 
         if self.current_state != self.previous_state:
@@ -299,26 +294,24 @@ class XYStageApp(app.App):
 
     # Stepper Tester:
     def _update_state_xystage(self, delta: int):
+        self.xystage['x'] = self._stepperX.get_pos(delta) - self._settings['XRange'].v//2        
         # Left/Right to adjust position
         pressed = False
         if self.button_states.get(BUTTON_TYPES["RIGHT"]):
             pressed = True
-            if self._auto_repeat_check(delta, True):
-                pos = self._stepperX.get_pos()
-                pos = self._inc(pos, self._auto_repeat_level + 1)
-                # Limit to the range of the stepper
-                if pos <= self._settings['XRange'].v:
-                    self._stepperX.target(pos)
-                    self._refresh = True
+            if self._auto_repeat_check(delta, False):
+                speed = abs(self._stepperX.get_speed())
+                # estimate the amount of movement based on the speed and time since last update         
+                speed = max(self._settings['min_speed'].v, self._inc(speed, 1 + self._auto_repeat_level))
+                self._stepperX.speed(speed)              
+                self._refresh = True
         elif self.button_states.get(BUTTON_TYPES["LEFT"]):
             pressed = True
-            if self._auto_repeat_check(delta, True):
-                pos = self._stepperX.get_pos()
-                pos = self._dec(pos, self._auto_repeat_level + 1)
-                # Limit to the range of the stepper
-                if pos >= 0:
-                    self._stepperX.target(pos)
-                    self._refresh = True
+            if self._auto_repeat_check(delta, False):
+                speed = abs(self._stepperX.get_speed())            
+                speed = max(self._settings['min_speed'].v, self._inc(speed, 1 + self._auto_repeat_level))
+                self._stepperX.speed(-speed)
+                self._refresh = True
         if self.button_states.get(BUTTON_TYPES["UP"]):
             pressed = True
             if self._auto_repeat_check(delta, True):
@@ -341,6 +334,7 @@ class XYStageApp(app.App):
             self._time_since_last_input = 0
         else:
             self._auto_repeat_clear()
+            self._stepperX.speed(0)
             # non auto-repeating buttons
             if self.button_states.get(BUTTON_TYPES["CANCEL"]):
                 self.button_states.clear()
@@ -362,9 +356,6 @@ class XYStageApp(app.App):
                 print("Stepper:Timeout")          
 
         # if the stepperX or stepperY position has changed then update the display by setting refresh to True
-        if (self._stepperX.get_pos() - self._settings['XRange'].v//2) != self.xystage['x']:
-            self._refresh = True
-            self.xystage['x'] = self._stepperX.get_pos() - self._settings['XRange'].v//2
         if (self._stepperY.get_pos() - self._settings['YRange'].v//2) != self.xystage['y']:
             self._refresh = True
             self.xystage['y'] = self._stepperY.get_pos() - self._settings['YRange'].v//2
@@ -564,12 +555,8 @@ class XYStageApp(app.App):
                             try:
                                 # End stop - needs to be a HS pin to support interrupts
                                 endstop_pin = HexpansionConfig(XYSTAGE_HEXPANSION).pin[X_ENDSTOP]
-                                self._stepperX = Stepper(self, endstop = endstop_pin, name = "X", step_size=1, timer_id=i, max_pos=self._settings['XRange'].v)
+                                self._stepperX = Stepper(self, endstop = endstop_pin, name = "X", max_sps = self._settings['max_speed'].v, max_pos=self._settings['XRange'].v)
                                 print(f"StepperX:Init {i}")
-                                # Start off assuming stage is in last known position
-                                self._stepperX.overwrite_pos(self.xystage['x'] + self._settings['XRange'].v//2)
-                                pos = self._stepperX.get_pos()
-                                self._stepperX.target(pos)
                                 continue
                             except:
                                 print(f"StepperX:Init {i} Failed")
@@ -599,7 +586,7 @@ class XYStageApp(app.App):
                     self._refresh = True
                     self._auto_repeat_clear()
                     self._stepperX.enable(True)
-                    self._stepperX.speed(_STEPPER_DEFAULT_SPEED)                    
+                    #self._stepperX.speed(_STEPPER_DEFAULT_SPEED)                    
                     self._stepperY.enable(True)
                     self._stepperY.speed(_STEPPER_DEFAULT_SPEED)
                     self._time_since_last_input = 0                                       
@@ -690,55 +677,47 @@ class XYStageApp(app.App):
 
 ######## STEPPER MOTOR CLASS ########
 
-class Stepper:
-    def __init__(self, container, endstop: Pin = None, name: str = "", step_size: int = 1, speed_sps: int = _STEPPER_DEFAULT_SPEED, max_sps: int = _STEPPER_MAX_SPEED, max_pos: int = _STEPPER_MAX_POSITION, timer_id: int = 0):
+class Stepper:  # External Driver, Speed Control Only via PWM
+    def __init__(self, container, endstop: Pin = None, name: str = "", speed_sps: int = _STEPPER_DEFAULT_SPEED, max_sps: int = _STEPPER_MAX_SPEED, max_pos: int = _STEPPER_MAX_POSITION):
         self._container = container
         self._name = name 
         self._calibrated = False
-        self._timer = Timer(timer_id)
+        #self._timer = Timer(timer_id)
         self._timer_is_running = False
         self._timer_mode = 0
-        self._free_run_mode = 0                     # direction of free run mode
+        self._pos = 0                               # current position in steps
+        self._free_run_mode = 1                     # direction of free run mode
         self._enabled = False
-        self._target_pos = 0
-        self._pos = 0                               # current position in half steps
-        self._max_sps = int(max_sps)                # max speed in full steps per second
-        self._steps_per_sec = int(speed_sps)        # current speed in full steps per second
-        self._max_pos = 2*int(max_pos)              # max position stored in half steps
+        self._max_sps = int(max_sps)                # max speed in steps per second
+        self._steps_per_sec = int(speed_sps)        # current speed in steps per second
+        self._max_pos = int(max_pos)                # max position stored in half steps
         self._freq = 0
-        self._min_period = 0
-        self._step_size = int(step_size)            # 1 = half steps, 2 = full steps
-        self._last_step_time = 0    
-        self.track_target()
 
-        # LS Pins for external stepper driver
+        # Pins for external stepper driver
         self._hexpansion_config = HexpansionConfig(XYSTAGE_HEXPANSION)
         self._pins = {}
         # Direction Pin
         self._pins["x_dir"]  = self._hexpansion_config.ls_pin[X_DIR]
         self._pins["x_dir"].init(mode=Pin.OUT)
         self._pins["x_dir"].off()
-        # Enable Pin
+        # Enable Pin - active low
         self._pins["x_en"]   = self._hexpansion_config.ls_pin[X_ENABLE]
         self._pins["x_en"].init(mode=Pin.OUT)
         self._pins["x_en"].on()
-        # Step Pin
+        # Step Pin - needs to be a HS pin to support PWM
         self._pins["x_step"]  = self._hexpansion_config.pin[X_STEP]
-        self._pins["x_step"].init(mode=Pin.OUT)
-        self._pins["x_step"].off()      
+        #self._pins["x_step"].init(mode=Pin.OUT)
+        #self._pins["x_step"].off()
+        # Setup PWM output on the step pin
+        try:
+            self._pwm = PWM(self._pins["x_step"], freq=10, duty_ns=2000)    # 0 Hz is invalid but 0 duty is allowed
+        except Exception as e:
+            print(f"{self._name} PWM failed:{e}")
         # End stop - needs to be a HS pin to support interrupts 
         if endstop is not None:
             endstop.init(mode=Pin.IN, pull=Pin.PULL_UP)
             endstop.irq(trigger=Pin.IRQ_FALLING, handler=self._hit_endstop)
   
-        
-    def step_size(self,sz=1):
-        if sz < 1:
-            sz = 1
-        elif sz > 2:
-            sz = 2
-        self._step_size = int(sz)
-
     def speed(self,sps):    # speed in FULL steps per second
         if self._free_run_mode == 1 and sps < 0:
             self._free_run_mode = -1
@@ -749,58 +728,26 @@ class Stepper:
         elif sps < -self._max_sps:
             sps = -self._max_sps
         self._steps_per_sec = int(sps)
-        self._update_timer((2//self._step_size)*abs(self._steps_per_sec))    # steps per second
+        self._update_timer(abs(self._steps_per_sec))    # steps per second
 
     def get_speed(self) -> int:
         return self._steps_per_sec
 
-    def target(self,t):
-        if self._calibrated and t < 0:
-            # when already calibrated limit to 0
-            self._target_pos = 0
-        elif self._calibrated and (2*int(t)) > self._max_pos:
-            # when already calibrated limit to max
-            self._target_pos = self._max_pos
-        else:
-            self._target_pos = 2*int(t)
-    
-    def get_pos(self) -> int:
-        return (self._pos//2)   # convert half steps to full steps
-       
-    def overwrite_pos(self,p=0):
-        self._pos = 2*int(p)    # convert full steps to half steps
-
-    def step(self,d=0):
-        cur_time = time.ticks_ms()
-        if time.ticks_diff(cur_time, self._last_step_time) < self._min_period:
-            # avoid stepping too quickly as this causes skipped steps
-            return
-        self._last_step_time = cur_time
-        if d>0:
-            self._pins["x_en"].off()     # active low enable
-            self._pins["x_dir"].off()
-            self._pos+=self._step_size
-        elif d<0:
-            self._pins["x_en"].off()    # active low enable
-            self._pins["x_dir"].on()
-            self._pos-=self._step_size
-        # Check position limits
+    # function to estimate the current position based on the speed and time since last update
+    def get_pos(self, delta) -> int:
+        steps = (self._steps_per_sec * delta) // 1000
+        self._pos += steps
+        # Check if we have hit the end stop
         if self._calibrated and self._pos < 0:
             print(f"{self._name} s/w min endstop")
-            self._pos = 0
+            #self._pos = 0
             self.speed(0)
-            return
         elif self._calibrated and self._pos > self._max_pos:
             print(f"{self._name} s/w max endstop")
-            self._pos = self._max_pos
-            self.speed(0)
-            return
-        try:
-            self._pins["x_step"].on()            
-            self._pins["x_step"].off()                   
-        except Exception as e:
-            print(f"{self._name} step failed:{e}")
-
+            #self._pos = self._max_pos
+            self.speed(0)        
+        return self._pos 
+        
     def _hit_endstop(self, pin: Pin):           
         # double check the endstop is hit
         # if not, ignore the interrupt
@@ -808,72 +755,42 @@ class Stepper:
             print(f"{self._name} Endstop - hit")
             if not self._calibrated:
                 self._calibrated = True
-            # if we were moving towards the endstop, stop
-            if self._free_run_mode < 0:
-                self.speed(0)
-                # set this as the new zero position
-                self.overwrite_pos(0)                   
-            elif self._free_run_mode == 0 and self._target_pos < self._pos:
-                self.speed(0)
+                self._pos = 0
+            self.speed(0)
         else:
             print(f"{self._name} Endstop - false alarm")
 
-    def _timer_callback_fwd(self,t):
-        self.step(1)
-
-    def _timer_callback_rev(self,t):
-        self.step(-1)
-
-    def _timer_callback(self,t):
-        if self._target_pos>self._pos:
-            self.step(1)
-        elif self._target_pos<self._pos:
-            self.step(-1)
-        else:
-            # power down the stepper
-            self._pins["x_en"].on()    # active low enable
-
-    def free_run(self,d=1):
-        self._free_run_mode=d
-        if d!=0:
-            self._update_timer((2//self._step_size)*abs(self._steps_per_sec))   # half steps per second
-
-    def track_target(self):
-        self._free_run_mode=0
-        self._update_timer((2//self._step_size)*abs(self._steps_per_sec))      # half steps per second
-
     def _update_timer(self,freq):
-        if self._timer_is_running and freq != self._freq:
-            try:
-                self._timer.deinit()
-                self._freq = 0
-                self._timer_is_running=False
-            except Exception as e:
-                print(f"{self._name} update_timer failed:{e}")
-        if 0 != freq and (freq != self._freq or self._free_run_mode != self._timer_mode):
+        if freq == 0:
+            print(f"{self._name} Timer: 0Hz")
+            self._pins["x_en"].on()        # disable the stepper
+            self._pwm.duty_ns(0)        # stop the PWM (frequency of 0 is not allowed)
+            self._freq = 0   
+        elif freq != self._freq or self._free_run_mode != self._timer_mode:
             try:                
                 print(f"{self._name} Timer:{self._free_run_mode} {freq}Hz")
                 if self._free_run_mode>0:
-                    self._timer.init(freq=freq,callback=self._timer_callback_fwd)
                     self._pins["x_dir"].off()
+                    self._pwm.freq(int(freq))
+                    self._pwm.duty_ns(12000)     # minimum 1.9uS STEP pulse width for DRV8825                     
+                    self._pins["x_en"].off()    # enable active low
                 elif self._free_run_mode<0:
-                    self._timer.init(freq=freq,callback=self._timer_callback_rev)
                     self._pins["x_dir"].on()
+                    self._pwm.freq(int(freq))
+                    self._pwm.duty_ns(12000)     # minimum 1.9uS STEP pulse width for DRV8825                      
+                    self._pins["x_en"].off()    # enable active low
                 else:
-                    self._timer.init(freq=freq,callback=self._timer_callback)
+                    self._pins["x_en"].on()
+                    self._pwm.duty_ns(0)        # stop the PWM (frequency of 0 is not allowed)   
                 self._freq = freq
-                self._min_period = (1000//freq) - 1
                 self._timer_is_running=True
                 self._timer_mode = self._free_run_mode
             except Exception as e:
                 print(f"{self._name} update_timer failed:{e}")
-        elif freq == 0:
-            print(f"{self._name} Timer: 0Hz")
-            self._pins["x_en"].on()
+
 
     def stop(self):
         self._update_timer(0)
-
 
     def enable(self,e = True):
         self._enabled=e
@@ -881,7 +798,7 @@ class Stepper:
         try:
             if e:
                 if self._free_run_mode!=0:
-                    self._update_timer((2//self._step_size)*abs(self._steps_per_sec))   # half steps per second                
+                    self._update_timer(abs(self._steps_per_sec))   # steps per second                
             else:
                 self._update_timer(0)
         except Exception as e:
