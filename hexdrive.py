@@ -11,12 +11,11 @@ from system.scheduler.events import RequestStopAppEvent
 import app
 
 # HexDrive.py App Version - used to check if upgrade is required
-APP_VERSION = 5 
+APP_VERSION = 6 
 
 
 _ENABLE_PIN  = 0  # First LS pin used to enable the SMPSU
 _DETECT_PIN  = 1  # Second LS pin used to sense if the SMPSU has a source of power
-_ENDSTOP_PIN = 4  # Endstop switch input pin
 
 _DEFAULT_PWM_FREQ = 20000    
 _DEFAULT_SERVO_FREQ = 50            # 20mS period
@@ -61,7 +60,6 @@ class HexDriveApp(app.App):
         # LS Pins
         self._power_detect  = self.config.ls_pin[_DETECT_PIN]
         self._power_control = self.config.ls_pin[_ENABLE_PIN]
-        self._endstop       = self.config.ls_pin[_ENDSTOP_PIN]  # For Stepper Motor mounted on linear rail with endstop switch
 
         self._servo_centre = [_SERVO_CENTRE] * 4
         eventbus.on_async(RequestStopAppEvent, self._handle_stop_app, self)
@@ -94,7 +92,6 @@ class HexDriveApp(app.App):
         try:
             self._power_detect.init(mode=Pin.IN)
             self._power_control.init(mode=Pin.OUT)
-            self._endstop.init(mode=Pin.IN) # ideally want to configure this as an input with pullup and interrupt
         except Exception as e:
             print(f"H:{self.config.port}:ls_pin setup failed {e}")
             return False
@@ -391,7 +388,7 @@ class HexDriveApp(app.App):
 
 ## Stepper Motor Support
     # Stepper Motor Support - force output to a specific phase
-    def motor_step(self, phase: int) -> bool:
+    def motor_step(self, phase: int):
         if phase >= _STEPPER_NUM_PHASES:
             return None
         if not self._stepper:
@@ -402,12 +399,6 @@ class HexDriveApp(app.App):
             self.config.pin[channel].value(value)
         self._outputs_energised = True  
         self._time_since_last_update = 0
-        # check if we have reached the endstop
-        # we are assuming that the endstop is active low         
-        if not self._endstop.value():
-            return False                   
-        return True
-
 
     def motor_release(self):
         for channel in range(4):
