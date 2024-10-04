@@ -1,4 +1,6 @@
 import asyncio
+import aioble
+import bluetooth
 import os
 import time
 from math import cos, pi
@@ -28,12 +30,23 @@ import app
 
 from .utils import chain, draw_logo_animated, parse_version
 
+
+
+# See the following for generating UUIDs:
+# https://www.uuidgenerator.net/
+_BLE_SERVICE_UUID = bluetooth.UUID('19b10000-e8f2-537e-4f6c-d104768a1214')
+_BLE_SENSOR_CHAR_UUID = bluetooth.UUID('19b10001-e8f2-537e-4f6c-d104768a1214')
+_BLE_LED_UUID = bluetooth.UUID('19b10002-e8f2-537e-4f6c-d104768a1214')
+# How frequently to send advertising beacons.
+_ADV_INTERVAL_MS = 250_000
+
+
 # Hard coded to talk to EEPROMs on address 0x50 - because we know that is what is on the HexDrive Hexpansion
 # makes it a lot more efficient than scanning the I2C bus for devices and working out what they are
 
-CURRENT_APP_VERSION = 5 # HEXDRIVE.PY Integer Version Number - checked against the EEPROM app.py version to determine if it needs updating
+CURRENT_APP_VERSION = 6 # HEXDRIVE.PY Integer Version Number - checked against the EEPROM app.py version to determine if it needs updating
 
-_APP_VERSION = "1.3" # BadgeBot App Version Number
+_APP_VERSION = "1.4" # BadgeBot App Version Number
 
 # If you change the URL then you will need to regenerate the QR code
 _QR_CODE = [0x1fcf67f, 
@@ -134,6 +147,11 @@ _EEPROM_ADDR  = 0x50
 _EEPROM_NUM_ADDRESS_BYTES = 2
 _EEPROM_PAGE_SIZE = 32
 _EEPROM_TOTAL_SIZE = 64 * 1024 // 8
+
+X_DIR = 0
+X_STEP = 1
+Y_DIR = 2
+Y_STEP = 3
 
 
 #Misceallaneous Settings
@@ -299,6 +317,14 @@ class BadgeBotApp(app.App):
 
         eventbus.on_async(RequestForegroundPushEvent, self._gain_focus, self)
         eventbus.on_async(RequestForegroundPopEvent, self._lose_focus, self)
+
+        ### Bluetooth ###
+        # Register GATT server, the service and characteristics
+        self.ble_service = aioble.Service(_BLE_SERVICE_UUID)
+        self.sensor_characteristic = aioble.Characteristic(self.ble_service, _BLE_SENSOR_CHAR_UUID, read=True, notify=True)
+        self.led_characteristic = aioble.Characteristic(self.ble_service, _BLE_LED_UUID, read=True, write=True, notify=True, capture=True)
+        # Register service(s)
+        #aioble.register_services(self.ble_service)
 
         # We start with focus on launch, without an event emmited
         self._gain_focus(RequestForegroundPushEvent(self))  
@@ -2003,9 +2029,7 @@ class Stepper:
             self.speed(0)
             return
         try:
-            if not self._hexdrive_app.motor_step(self._phase):
-                # we have reached the endstop
-                self._hit_endstop()
+            self._hexdrive_app.motor_step(self._phase)
         except Exception as e:                       
             print(f"step phase {self._phase} failed:{e}")
 
