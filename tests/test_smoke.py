@@ -9,30 +9,15 @@ import sim.run
 from system.hexpansion.config import HexpansionConfig
 
 
-def test_import_badgebot_app_and_app_export():
-    import sim.apps.BadgeBot.app as BadgeBot
-    from sim.apps.BadgeBot import BadgeBotApp
-    assert BadgeBot.__app_export__ == BadgeBotApp
+def test_import_xystage_app_and_app_export():
+    import sim.apps.XYStage.app as XYStage
+    from sim.apps.XYStage import XYStageApp
+    assert XYStage.__app_export__ == XYStageApp
 
-def test_import_hexdrive_app_and_app_export():
-    import sim.apps.BadgeBot.hexdrive as HexDrive
-    from sim.apps.BadgeBot.hexdrive import HexDriveApp
-    assert HexDrive.__app_export__ == HexDriveApp
-
-def test_badgebot_app_init():
-    from sim.apps.BadgeBot import BadgeBotApp
-    BadgeBotApp()
-
-def test_hexdrive_app_init(port):
-    from sim.apps.BadgeBot.hexdrive import HexDriveApp
-    config = HexpansionConfig(port)
-    HexDriveApp(config)
+def test_xystage_app_init():
+    from sim.apps.XYStage import XYStageApp
+    XYStageApp()
 
 @pytest.fixture
 def port():
     return 1
-
-def test_app_versions_match():
-    import sim.apps.BadgeBot.app as BadgeBot
-    import sim.apps.BadgeBot.hexdrive as HexDrive
-    assert BadgeBot.CURRENT_APP_VERSION == HexDrive.APP_VERSION

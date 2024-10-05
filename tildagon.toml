@@ -1,6 +1,6 @@
 [app]
 # The name of your app as displayed in the menu
-name = "BadgeBot"
+name = "XYStage"
 
 # The submenu where your app should appear.
 # One of: "Badge", "Music", "Media", "Apps", "Games"
@@ -18,7 +18,7 @@ category = "Apps"
 
 [entry]
 # The name of your entry point `Application` class
-# class = "BadgeBotApp"
+# class = "XYStageApp"
 
 [metadata]
 # Your nickname.  Must be at most 32 characters!
@@ -28,13 +28,13 @@ author = "Team Robotmad"
 license = "LGPL-3.0-only"
 
 # URL to the repository of your app.
-url = "https://www.github.com/TeamRobotmad/BadgeBot"
+url = "https://www.github.com/TeamRobotmad/XYStage"
 
 # Description of your app.  Maximum 140 characters!
-description = "A demo tildagon app for use with Hex Drive hexpansion "
+description = "A tildagon app to control a microsope XY Stage driven by 2 stepper motors "
 
 # Version number of your app.  If you push a commit where this number is
 # increased, we interpret this as a new version being released.
 #
 # Version number must be an integer!
-version = "0.5.1"
+version = "0.1.0"

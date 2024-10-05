@@ -19,7 +19,7 @@ jobs:
     - name: Manage submodule
       run: |
         git submodule update --init --force --remote
-        cd ./sim/apps/BadgeBot
+        cd ./sim/apps/XYStage
         git checkout  ${{ github.head_ref || github.ref_name }} 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v3
@@ -32,5 +32,5 @@ jobs:
         pip install pytest
     - name: Run the tests
       run: |
-        cd ./sim/apps/BadgeBot
+        cd ./sim/apps/XYStage
         pytest tests

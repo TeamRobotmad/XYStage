@@ -1,6 +1,6 @@
 {
-    "callable": "BadgeBotApp",
-    "name": "BadgeBot",
+    "callable": "XYStageApp",
+    "name": "XYStage",
     "category": "unknown",
     "hidden": false
 }

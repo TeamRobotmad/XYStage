@@ -1,1 +1,1 @@
-from .app import BadgeBotApp
+from .app import XYStageApp
