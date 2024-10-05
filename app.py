@@ -1,4 +1,6 @@
 import asyncio
+import aioble
+import bluetooth
 import os
 import time
 from math import cos, pi
@@ -10,11 +12,11 @@ from app_components.tokens import label_font_size, twentyfour_pt, clear_backgrou
 from app_components import Menu
 from events.input import BUTTON_TYPES, Button, Buttons, ButtonUpEvent
 from frontboards.twentyfour import BUTTONS
-from machine import I2C
+from machine import I2C, Timer
 from system.eventbus import eventbus
 from system.hexpansion.events import (HexpansionInsertionEvent,
                                       HexpansionRemovalEvent)
-from system.hexpansion.header import HexpansionHeader
+from system.hexpansion.header import HexpansionHeader, write_header, read_header
 from system.hexpansion.util import get_hexpansion_block_devices
 from system.patterndisplay.events import PatternDisable, PatternEnable
 from system.scheduler import scheduler
@@ -28,12 +30,23 @@ import app
 
 from .utils import chain, draw_logo_animated, parse_version
 
+
+
+# See the following for generating UUIDs:
+# https://www.uuidgenerator.net/
+_BLE_SERVICE_UUID = bluetooth.UUID('19b10000-e8f2-537e-4f6c-d104768a1214')
+_BLE_SENSOR_CHAR_UUID = bluetooth.UUID('19b10001-e8f2-537e-4f6c-d104768a1214')
+_BLE_LED_UUID = bluetooth.UUID('19b10002-e8f2-537e-4f6c-d104768a1214')
+# How frequently to send advertising beacons.
+_ADV_INTERVAL_MS = 250_000
+
+
 # Hard coded to talk to EEPROMs on address 0x50 - because we know that is what is on the HexDrive Hexpansion
 # makes it a lot more efficient than scanning the I2C bus for devices and working out what they are
 
-CURRENT_APP_VERSION = 4 # HEXDRIVE.PY Integer Version Number - checked against the EEPROM app.py version to determine if it needs updating
+CURRENT_APP_VERSION = 6 # HEXDRIVE.PY Integer Version Number - checked against the EEPROM app.py version to determine if it needs updating
 
-_APP_VERSION = "1.2" # BadgeBot App Version Number
+_APP_VERSION = "1.4" # BadgeBot App Version Number
 
 # If you change the URL then you will need to regenerate the QR code
 _QR_CODE = [0x1fcf67f, 
@@ -83,6 +96,13 @@ _SERVO_MIN_RATE        = 1          # *10us per s
 _SERVO_MAX_TRIM        = 1000       # us
 _MAX_SERVO_RANGE       = 1400       # 1400us either side of centre (VERY WIDE)
 
+# Stepper Tester - Defaults
+_STEPPER_MAX_SPEED     = 200        # full steps per second
+_STEPPER_MAX_POSITION  = 3100       # full steps from h/w endstop to s/w endstop at the other end
+_STEPPER_DEFAULT_SPEED = 50         # full steps per second
+_STEPPER_NUM_PHASES    = 8          # half steps
+_STEPPER_DEFAULT_SPR   = 200        # full steps per revolution
+_STEPPER_DEFAULT_STEP  = 1          # half steps, (2 = full steps)
 
 # Timings
 _TICK_MS       =  10        # Smallest unit of change for power, in ms
@@ -115,7 +135,8 @@ STATE_ERROR = 13          # Hexpansion error
 STATE_MESSAGE = 14        # Message display
 STATE_LOGO = 15           # Logo display
 STATE_SERVO = 16          # Servo test
-STATE_SETTINGS = 17       # Edit Settings
+STATE_STEPPER = 17        # Stepper test
+STATE_SETTINGS = 18       # Edit Settings
 
 # App states where user can minimise app
 _MINIMISE_VALID_STATES = [0, 1, 7, 12, 13, 14, 15]
@@ -127,13 +148,62 @@ _EEPROM_NUM_ADDRESS_BYTES = 2
 _EEPROM_PAGE_SIZE = 32
 _EEPROM_TOTAL_SIZE = 64 * 1024 // 8
 
+X_DIR = 0
+X_STEP = 1
+Y_DIR = 2
+Y_STEP = 3
+
 
 #Misceallaneous Settings
 _LOGGING = False
 _ERASE_SLOT = 0   # Slot for user to set if they want to erase EEPROMs on HexDrives
 
 # 
-_main_menu_items = ["Motor Moves", "Servo Test", "Settings", "About","Exit"]
+_main_menu_items = ["Motor Moves", "Stepper Test", "Servo Test", "Settings", "About","Exit"]
+
+class StepperMode:
+    OFF = 0
+    POSITION = 1
+    SPEED = 2
+    stepper_modes = ["OFF", "POSITION", "SPEED"]
+
+    def __init__(self, mode = OFF):
+        self.mode = mode
+        
+    def set(self, mode):
+        self.mode = mode
+
+    def inc(self):
+        self.mode = (self.mode + 1) % 3
+
+    def __eq__(self, other):
+        return self.mode == other
+    
+    def __str__(self):
+        return self.stepper_modes[self.mode]
+
+
+class ServoMode:
+    OFF = 0
+    TRIM = 1
+    POSITION = 2
+    SCANNING = 3
+    servo_modes = ["OFF", "TRIM", "POSITION", "SCANNING"]
+    
+    def __init__(self, mode = OFF):
+        self.mode = mode
+
+    def set(self, mode):
+        self.mode = mode
+
+    def inc(self):
+        self.mode = (self.mode + 1) % 4
+    
+    def __eq__(self, other):
+        return self.mode == other
+    
+    def __str__(self):
+        return self.servo_modes[self.mode]
 
 
 class BadgeBotApp(app.App):
@@ -142,31 +212,31 @@ class BadgeBotApp(app.App):
         # UI Button Controls
         self.button_states = Buttons(self)
         self.last_press: Button = BUTTON_TYPES["CANCEL"]
-        self.long_press_delta = 0
+        self.long_press_delta: int = 0
         self._auto_repeat_intervals = [ _AUTO_REPEAT_MS, _AUTO_REPEAT_MS//2, _AUTO_REPEAT_MS//4, _AUTO_REPEAT_MS//8, _AUTO_REPEAT_MS//16] # at the top end the loop is unlikley to cycle this fast
-        self._auto_repeat = 0
-        self._auto_repeat_count = 0
-        self._auto_repeat_level = 0
+        self._auto_repeat: int = 0
+        self._auto_repeat_count: int = 0
+        self._auto_repeat_level: int = 0
 
         # UI Feature Controls
-        self._refresh = True
-        self.rpm = 5                    # logo rotation speed in RPM
-        self._animation_counter = 0
-        self._pattern_status = True     # True = Pattern Enabled, False = Pattern Disabled
+        self._refresh: bool = True
+        self.rpm: float = 5                    # logo rotation speed in RPM
+        self._animation_counter: float = 0
+        self._pattern_status: bool = True     # True = Pattern Enabled, False = Pattern Disabled
         self.qr_code = _QR_CODE
-        self.b_msg = f"BadgeBot V{_APP_VERSION}"
-        self.t_msg = "RobotMad"
-        self.is_scroll = False
-        self.scroll_offset = 0
-        self.notification = None
+        self.b_msg: str = f"BadgeBot V{_APP_VERSION}"
+        self.t_msg: str = "RobotMad"
+        self.is_scroll: bool = False
+        self.scroll_offset: int = 0
+        self.notification: Notification = None
         self.error_message = []
-        self.current_menu = None
-        self.menu = None
+        self.current_menu: str = None
+        self.menu: Menu = None
 
         # BadgeBot Control Sequence Variables
-        self.run_countdown_elapsed_ms = 0
+        self.run_countdown_elapsed_ms: int = 0
         self.instructions = []
-        self.current_instruction = None
+        self.current_instruction: Instruction = None
         self.current_power_duration = ((0,0,0,0), 0)
         self.power_plan_iter = iter([])
 
@@ -182,8 +252,9 @@ class BadgeBotApp(app.App):
         self._settings['brightness']    = MySetting(self._settings, _BRIGHTNESS, 0.1, 1.0)
         self._settings['logging']       = MySetting(self._settings, _LOGGING, False, True)
         self._settings['erase_slot']    = MySetting(self._settings, _ERASE_SLOT, 0, 6)
+        self._settings['step_max_pos']  = MySetting(self._settings, _STEPPER_MAX_POSITION, 0, 65535)
 
-        self._edit_setting = None
+        self._edit_setting: int  = None
         self._edit_setting_value = None       
         self.update_settings()   
 
@@ -202,48 +273,61 @@ class BadgeBotApp(app.App):
         self._HEXDRIVE_TYPES = [HexDriveType(0xCBCB, motors=2, servos=4), 
                                 HexDriveType(0xCBCA, motors=2, name="2 Motor"), 
                                 HexDriveType(0xCBCC, servos=4, name="4 Servo"), 
-                                HexDriveType(0xCBCD, motors=1, servos=2, name = "1 Mot 2 Srvo")]  
+                                HexDriveType(0xCBCD, motors=1, servos=2, name="1 Mot 2 Srvo"),
+                                HexDriveType(0xCBCE, steppers=1, name="Stepper")]  
         self.hexpansion_slot_type = [None]*6
-        self.hexpansion_init_type = 0
-        self.detected_port = None
-        self.waiting_app_port = None
-        self.erase_port = None
-        self.upgrade_port = None
-        self.hexdrive_port = None
+        self.hexpansion_init_type: int = 0
+        self.detected_port: int = None
+        self.waiting_app_port: int = None
+        self.erase_port: int  = None
+        self.upgrade_port: int = None
+        self.hexdrive_port: int = None
         self.ports_with_blank_eeprom = set()
         self.ports_with_hexdrive = set()
         self.ports_with_latest_hexdrive = set()
         self.hexdrive_app = None
-        self.hexpansion_update_required = False # flag from async to main loop
+        self.hexpansion_update_required: bool = False # flag from async to main loop
         eventbus.on_async(HexpansionInsertionEvent, self._handle_hexpansion_insertion, self)
         eventbus.on_async(HexpansionRemovalEvent, self._handle_hexpansion_removal, self)
 
         # Motor Driver
-        self.num_motors   = 2       # Default assumed for a single HexDrive
+        self.num_motors: int = 2       # Default assumed for a single HexDrive
+        self.num_steppers: int = 1       # Default assumed for a single HexDrive
+        self._stepper: Stepper = None
+        self.stepper_mode = StepperMode()
+        self.stepper_pos: int = 0
 
         # Servo Tester
-        self._time_since_last_update = 0
-        self._keep_alive_period      = 500              # ms (half the value used in hexdrive.py)  
-        self.num_servos   = 4       # Default assumed for a single HexDrive
-        self.servo        = [None]*4                    # Servo Positions
-        self.servo_centre = [_SERVO_DEFAULT_CENTRE]*4   # Trim Servo Centre
-        self.servo_range  = [_SERVO_DEFAULT_RANGE]*4    # Limit Servo Range
-        self.servo_rate   = [_SERVO_DEFAULT_RATE]*4     # Servo Rate of Change
-        self.servo_mode   = [_SERVO_DEFAULT_MODE]*4     # Servo Mode [0:Position, 1: Scan]
-        self.servo_selected = 0
-        self._servo_modes = ['Off','Trim','Position','Scanning']
+        self._time_since_last_input: int = 0
+        self._timeout_period: int = 120000                     # ms (2 minutes - without any user input)       
+        self._time_since_last_update: int = 0
+        self._keep_alive_period: int = 500                     # ms (half the value used in hexdrive.py)  
+        self.num_servos: int     = 4                           # Default assumed for a single HexDrive
+        self.servo               = [None]*4                    # Servo Positions
+        self.servo_centre        = [_SERVO_DEFAULT_CENTRE]*4   # Trim Servo Centre
+        self.servo_range         = [_SERVO_DEFAULT_RANGE]*4    # Limit Servo Range
+        self.servo_rate          = [_SERVO_DEFAULT_RATE]*4     # Servo Rate of Change
+        self.servo_mode          = [ServoMode()]*4             # Servo Mode
+        self.servo_selected: int = 0
 
         # Overall app state (controls what is displayed and what user inputs are accepted)
         self.current_state = STATE_INIT
         self.previous_state = self.current_state
-
+        self._update_period = 50  # ms
 
         eventbus.on_async(RequestForegroundPushEvent, self._gain_focus, self)
         eventbus.on_async(RequestForegroundPopEvent, self._lose_focus, self)
 
+        ### Bluetooth ###
+        # Register GATT server, the service and characteristics
+        self.ble_service = aioble.Service(_BLE_SERVICE_UUID)
+        self.sensor_characteristic = aioble.Characteristic(self.ble_service, _BLE_SENSOR_CHAR_UUID, read=True, notify=True)
+        self.led_characteristic = aioble.Characteristic(self.ble_service, _BLE_LED_UUID, read=True, write=True, notify=True, capture=True)
+        # Register service(s)
+        #aioble.register_services(self.ble_service)
+
         # We start with focus on launch, without an event emmited
-        self._gain_focus(RequestForegroundPushEvent(self))
-   
+        self._gain_focus(RequestForegroundPushEvent(self))  
 
 
     ### ASYNC EVENT HANDLERS ###
@@ -309,18 +393,19 @@ class BadgeBotApp(app.App):
             cur_time = time.ticks_ms()
             delta_ticks = time.ticks_diff(cur_time, last_time)
             self.background_update(delta_ticks)
-            s = 10 if self.current_state == STATE_RUN else 50
-            await asyncio.sleep_ms(s)
+            await asyncio.sleep_ms(self._update_period)
             last_time = cur_time
 
 
     ### NON-ASYNC FUCNTIONS ###
 
-    def background_update(self, delta):
+    def background_update(self, delta: int):
         if self.current_state == STATE_RUN:
+            # DC Motor Contorl
             output = self.get_current_power_level(delta)
             if output is None:
                 self.current_state = STATE_DONE
+                self._update_period = 50
             elif self.hexdrive_app is not None:
                 self.hexdrive_app.set_motors(output)
 
@@ -353,19 +438,17 @@ class BadgeBotApp(app.App):
             self.check_port_for_hexdrive(port)
 
 
-    def check_port_for_hexdrive(self, port) -> bool:
-        # avoiding use of badge read_hexpansion_header as this triggers a full i2c scan each time
+    def check_port_for_hexdrive(self, port: int) -> bool:
         # we know the EEPROM address so we can just read the header directly
         if port not in range(1, 7):
             return False
+        # We want to do this in two parts so that we detect if there is a valid EEPROM or not
         try:
-            header_bytes = I2C(port).readfrom_mem(_EEPROM_ADDR, 0, 32, addrsize = (8*_EEPROM_NUM_ADDRESS_BYTES))
+            hexpansion_header = read_header(port, addr_len=_EEPROM_NUM_ADDRESS_BYTES)
         except OSError:
             # no EEPROM on this port
             return False
-        try:
-            read_header = HexpansionHeader.from_bytes(header_bytes)
-        except Exception:
+        except RuntimeError:
             # not a valid header
             if self._settings['logging'].v:
                 print(f"H:Found EEPROM on port {port}")
@@ -373,7 +456,7 @@ class BadgeBotApp(app.App):
             return True
         # check is this is a HexDrive header by scanning the _HEXDRIVE_TYPES list
         for index, hexpansion_type in enumerate(self._HEXDRIVE_TYPES):
-            if read_header.vid == hexpansion_type.vid and read_header.pid == hexpansion_type.pid:
+            if hexpansion_header.vid == hexpansion_type.vid and hexpansion_header.pid == hexpansion_type.pid:
                 if self._settings['logging'].v:
                     print(f"H:Found '{hexpansion_type.name}' HexDrive on port {port}")
                 if port not in self.ports_with_latest_hexdrive:
@@ -384,7 +467,7 @@ class BadgeBotApp(app.App):
         return False
 
 
-    def update_app_in_eeprom(self, port, addr) -> bool:
+    def update_app_in_eeprom(self, port: int, addr: int) -> bool:
         # Copy hexdrive.mpy to EEPROM as app.mpy
         if self._settings['logging'].v:
             print(f"H:Updating HexDrive app.mpy on port {port}")
@@ -393,13 +476,13 @@ class BadgeBotApp(app.App):
         except Exception as e:
             print(f"H:Error opening I2C port {port}: {e}")
             return False
-        header = self.read_hexpansion_header(i2c=i2c)
+        header = read_header(port, addr_len = _EEPROM_NUM_ADDRESS_BYTES)
         if header is None:
             if self._settings['logging'].v:
                 print(f"H:Error reading header on port {port}")
             return False
         try:
-            _, partition = get_hexpansion_block_devices(i2c, header, addr)
+            _, partition = get_hexpansion_block_devices(i2c, header, addr, addr_len = _EEPROM_NUM_ADDRESS_BYTES)
         except RuntimeError as e:
             print(f"H:Error getting block devices: {e}")
             return False              
@@ -465,7 +548,7 @@ class BadgeBotApp(app.App):
         return True
     
 
-    def prepare_eeprom(self, port, addr) -> bool:
+    def prepare_eeprom(self, port: int, addr: int) -> bool:
         if self._settings['logging'].v:
             print(f"H:Initialising EEPROM on port {port}")
         hexdrive_header = HexpansionHeader(
@@ -481,32 +564,22 @@ class BadgeBotApp(app.App):
         # Write and read back header efficiently
         try:
             i2c = I2C(port)
-            i2c.writeto(addr, bytes([0]*_EEPROM_NUM_ADDRESS_BYTES) + hexdrive_header.to_bytes())
+        except Exception as e:
+            print(f"H:Error opening I2C port {port}: {e}")
+            return False
+        try:
+            write_header(port, hexdrive_header, addr_len = _EEPROM_NUM_ADDRESS_BYTES, page_size = _EEPROM_PAGE_SIZE)       
         except Exception as e:
             print(f"H:Error writing header: {e}")
             return False
-        # Poll ACK
-        while True:
-            try:
-                if i2c.writeto(addr, bytes([0]*_EEPROM_NUM_ADDRESS_BYTES)):  # Poll ACK
-                    break
-            except OSError:
-                pass
-            finally:
-                time.sleep_ms(1)
         try:
-            header_bytes = i2c.readfrom_mem(addr, 0, 32, addrsize = (8*_EEPROM_NUM_ADDRESS_BYTES))
+            hexpansion_header = read_header(port, addr_len = _EEPROM_NUM_ADDRESS_BYTES)
         except Exception as e:
             print(f"H:Error reading header back: {e}")
             return False
         try:
-            read_header = HexpansionHeader.from_bytes(header_bytes)
-        except Exception as e:
-            print(f"H:Error parsing header: {e}")
-            return False
-        try:
             # Get block devices
-            _, partition = get_hexpansion_block_devices(i2c, read_header, addr)
+            _, partition = get_hexpansion_block_devices(i2c, hexpansion_header, addr, addr_len = _EEPROM_NUM_ADDRESS_BYTES)
         except RuntimeError as e:
             print(f"H:Error getting block devices: {e}")
             return False           
@@ -538,19 +611,21 @@ class BadgeBotApp(app.App):
         return True 
 
 
-    def erase_eeprom(self, port, addr) -> bool:
+    def erase_eeprom(self, port: int, addr: int) -> bool:
         if self._settings['logging'].v:
             print(f"H:Erasing EEPROM on port {port}")
         try:
             i2c = I2C(port)
-            i2c.writeto(addr, bytes([0]*_EEPROM_NUM_ADDRESS_BYTES))
             # loop through all pages and erase them
             for page in range(_EEPROM_TOTAL_SIZE // _EEPROM_PAGE_SIZE):
-                i2c.writeto(addr, bytes([page >> 8, page & 0xFF]) + bytes([0xFF]*_EEPROM_PAGE_SIZE))
+                mem_addr = page * _EEPROM_PAGE_SIZE
+                #generate a bit mask for the address based on the number of address bytes
+                mem_addr_mask = 1<<(_EEPROM_NUM_ADDRESS_BYTES*8)-1
+                i2c.writeto_mem((addr | (mem_addr >> (8*_EEPROM_NUM_ADDRESS_BYTES))), (mem_addr & mem_addr_mask), bytes([0xFF]*_EEPROM_PAGE_SIZE), addrsize = (8*_EEPROM_NUM_ADDRESS_BYTES))
                 # check Ack
                 while True:
-                    try:
-                        if i2c.writeto(addr, bytes([page >> 8, page & 0xFF])):  # Poll ACK
+                    try:    # Poll Ack
+                        if i2c.writeto((addr | (mem_addr >> (8*_EEPROM_NUM_ADDRESS_BYTES))), bytes([mem_addr & 0xFF]) if _EEPROM_NUM_ADDRESS_BYTES == 1 else bytes([mem_addr >> 8, mem_addr & 0xFF])):
                             break
                     except OSError:
                         pass
@@ -559,25 +634,14 @@ class BadgeBotApp(app.App):
         except Exception as e:
             print(f"H:Error erasing EEPROM: {e}")
             return False
-        return True
+        return True 
 
 
-    def read_hexpansion_header(self, i2c=None, port=None) -> HexpansionHeader:                
-        try:
-            if i2c is None:
-                if port is None:
-                    return None
-                i2c = I2C(port)
-            header_bytes = i2c.readfrom_mem(_EEPROM_ADDR, 0, 32, addrsize = (8*_EEPROM_NUM_ADDRESS_BYTES))
-            return HexpansionHeader.from_bytes(header_bytes)
-        except OSError:     
-            return None   
-
-
-    def find_hexdrive_app(self, port) -> app:                    
+    def find_hexdrive_app(self, port: int) -> app:                    
         for an_app in scheduler.apps:
-            if hasattr(an_app, "config") and hasattr(an_app.config, "port") and  an_app.config.port == port:
-                return an_app
+            if type(an_app).__name__ is 'HexDriveApp':
+                if hasattr(an_app, "config") and hasattr(an_app.config, "port") and  an_app.config.port == port:
+                    return an_app
         return None
 
 
@@ -600,7 +664,7 @@ class BadgeBotApp(app.App):
 
     ### MAIN APP CONTROL FUNCTIONS ###
 
-    def update(self, delta):
+    def update(self, delta: int):
         if self.notification:
             self.notification.update(delta)
 
@@ -629,7 +693,7 @@ class BadgeBotApp(app.App):
 
     ### START UI FOR HEXPANSION INITIALISATION AND UPGRADE ###
 
-    def _update_hexpansion_management(self, delta):
+    def _update_hexpansion_management(self, delta: int):
         if self.current_state == STATE_INIT:
             # One Time initialisation
             self.scan_ports()
@@ -673,7 +737,7 @@ class BadgeBotApp(app.App):
                 self._update_state_check(delta)
 
 
-    def _update_main_application(self, delta):
+    def _update_main_application(self, delta: int):
         if self.current_state == STATE_MENU:
             if self.current_menu is None:
                 self.set_menu("main")
@@ -706,13 +770,17 @@ class BadgeBotApp(app.App):
         elif self.current_state == STATE_SERVO:
             self._update_state_servo(delta)
 
+    ### Stepper Tester Application ###
+        elif self.current_state == STATE_STEPPER:
+            self._update_state_stepper(delta)
+
     ### Settings Capability ###
         elif self.current_state == STATE_SETTINGS:
             self._update_state_settings(delta)
     ### End of Update ###
 
 
-    def _update_state_warning(self, delta):
+    def _update_state_warning(self, delta: int):
         if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
             self.button_states.clear()
             if self.current_state == STATE_WARNING or self.hexdrive_port is not None:
@@ -744,7 +812,7 @@ class BadgeBotApp(app.App):
                     tildagonos.leds[i] = (255,0,0)   
 
 
-    def _update_state_error(self, delta):                
+    def _update_state_error(self, delta: int):                
         if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
             # Error has been acknowledged by the user
             self.button_states.clear()
@@ -755,7 +823,7 @@ class BadgeBotApp(app.App):
                 tildagonos.leds[i] = (0,255,0) if self.current_state == STATE_MESSAGE else (255,0,0)       
 
 
-    def _update_state_programming(self, delta):        
+    def _update_state_programming(self, delta: int):        
         if self.upgrade_port is not None:
             if self.update_app_in_eeprom(self.upgrade_port, _EEPROM_ADDR):
                 self.notification = Notification("Upgraded", port = self.upgrade_port)
@@ -776,17 +844,19 @@ class BadgeBotApp(app.App):
             if self.prepare_eeprom(self.detected_port, _EEPROM_ADDR):
                 self.notification = Notification("Initialised", port = self.detected_port)
                 self.upgrade_port = self.detected_port
+                self.hexpansion_slot_type[self.detected_port-1] = self.hexpansion_init_type
                 self.current_state = STATE_UPGRADE                      
             else:
                 self.notification = Notification("Failed", port = self.detected_port)
                 self.error_message = ["EEPROM","initialisation","failed"]
+                self.hexpansion_slot_type[self.detected_port-1] = None
                 self.current_state = STATE_ERROR
             self.detected_port = None
         elif self._settings['logging'].v:
             print("H:Error - no port to program")    
 
 
-    def _update_state_detected(self, delta):            
+    def _update_state_detected(self, delta: int):            
         # We are currently asking the user if they want hexpansion EEPROM initialising
         if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
             self.button_states.clear()
@@ -815,7 +885,7 @@ class BadgeBotApp(app.App):
             self._refresh = True
 
 
-    def _update_state_erase(self, delta):
+    def _update_state_erase(self, delta: int):
         # We are currently asking the user if they want hexpansion EEPROM Erased                
         if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
             # Yes
@@ -838,7 +908,7 @@ class BadgeBotApp(app.App):
             self.current_state = STATE_CHECK  
 
 
-    def _update_state_upgrade(self, delta):                
+    def _update_state_upgrade(self, delta: int):                
         if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
             # Yes
             self.button_states.clear()
@@ -853,7 +923,7 @@ class BadgeBotApp(app.App):
             self.current_state = STATE_CHECK
 
 
-    def _update_state_check(self, delta):
+    def _update_state_check(self, delta: int):
         #print(f"Check: {self.ports_with_latest_hexdrive}")
         if 0 < len(self.ports_with_latest_hexdrive):
             # We have at least one HexDrive with the latest App.mpy
@@ -869,10 +939,11 @@ class BadgeBotApp(app.App):
                     self.hexdrive_port = valid_port
                     self.hexdrive_app = hexdrive_app
                     if self.hexpansion_slot_type[valid_port-1] is not None:
-                        self.num_motors = self._HEXDRIVE_TYPES[self.hexpansion_slot_type[valid_port-1]].motors
-                        self.num_servos = self._HEXDRIVE_TYPES[self.hexpansion_slot_type[valid_port-1]].servos
+                        self.num_motors   = self._HEXDRIVE_TYPES[self.hexpansion_slot_type[valid_port-1]].motors
+                        self.num_servos   = self._HEXDRIVE_TYPES[self.hexpansion_slot_type[valid_port-1]].servos
+                        self.num_steppers = self._HEXDRIVE_TYPES[self.hexpansion_slot_type[valid_port-1]].steppers
                     # only intended for use with a single active HexDrive at once at present
-                    if self.hexdrive_app.get_status():
+                    if (0 < self._HEXDRIVE_TYPES[self.hexpansion_slot_type[valid_port-1]].steppers) or self.hexdrive_app.get_status():
                         if self._settings['logging'].v:
                             print(f"H:HexDrive [{valid_port}] OK")
                         self.current_state = STATE_MENU
@@ -900,7 +971,7 @@ class BadgeBotApp(app.App):
             self.current_state = STATE_WARNING
 
 
-    def _check_hexpansion_ports(self, delta) -> bool:
+    def _check_hexpansion_ports(self, delta: int) -> bool:
         if 0 < len(self.ports_with_blank_eeprom):
             # if there are any ports with blank eeproms
             # Show the UI prompt and wait for button press
@@ -911,7 +982,7 @@ class BadgeBotApp(app.App):
         return False
 
 
-    def _check_hexdrive_ports(self, delta) -> bool:
+    def _check_hexdrive_ports(self, delta: int) -> bool:
         #print(f"Check HexDrive Ports: {self.waiting_app_port} {self.ports_with_hexdrive}")   
         if self.waiting_app_port is not None or (0 < len(self.ports_with_hexdrive)):
             # if there are any ports with HexDrives - check if they need upgrading/erasing
@@ -964,7 +1035,7 @@ class BadgeBotApp(app.App):
         return False
 
 
-    def _update_state_help(self, delta):            
+    def _update_state_help(self, delta: int):            
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
             self.current_state = STATE_MENU
@@ -982,7 +1053,7 @@ class BadgeBotApp(app.App):
                 self.current_state = STATE_LOGO
 
 
-    def _update_state_receive_instr(self, delta):            
+    def _update_state_receive_instr(self, delta: int):            
         # Enable/disable scrolling and check for long press
         if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
             self.long_press_delta += delta
@@ -1040,7 +1111,7 @@ class BadgeBotApp(app.App):
                 self._set_direction_leds(self.last_press)
 
 
-    def _set_direction_leds(self, direction):
+    def _set_direction_leds(self, direction: Button):
         if direction == BUTTON_TYPES["RIGHT"]:
             # Green = Starboard = Right
             self.clear_leds()
@@ -1063,7 +1134,7 @@ class BadgeBotApp(app.App):
             tildagonos.leds[7]  = (255, 0, 255)                
 
 
-    def _update_state_countdown(self, delta):            
+    def _update_state_countdown(self, delta: int):            
         self.clear_leds()
         self.run_countdown_elapsed_ms += delta
         if self.run_countdown_elapsed_ms >= _RUN_COUNTDOWN_MS:
@@ -1071,9 +1142,10 @@ class BadgeBotApp(app.App):
             if self.hexdrive_app is not None:
                 self.hexdrive_app.set_power(True)
             self.current_state = STATE_RUN
+            self._update_period = 10
 
 
-    def _update_state_done(self, delta):
+    def _update_state_done(self, delta: int):
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
             if self.hexdrive_app is not None:
@@ -1087,14 +1159,93 @@ class BadgeBotApp(app.App):
             self.current_power_duration = ((0,0,0,0), 0)
             self.current_state = STATE_COUNTDOWN
 
+    # Stepper Tester:
+    def _update_state_stepper(self, delta: int):
+        # Left/Right to adjust position
+        if self.button_states.get(BUTTON_TYPES["RIGHT"]):
+            if self._auto_repeat_check(delta, True):
+                if self.stepper_mode == StepperMode.SPEED:                      # Speed
+                    speed = self._stepper.get_speed()
+                    speed = self._inc(speed, self._auto_repeat_level+1)
+                    if _STEPPER_MAX_SPEED < speed:
+                        speed = _STEPPER_MAX_SPEED
+                    self._stepper.speed(speed)
+                else:
+                    if self.stepper_mode != StepperMode.POSITION:               # Position Mode
+                        self.stepper_mode.set(StepperMode.POSITION)
+                        self._stepper.speed(_STEPPER_DEFAULT_SPEED)
+                        self._stepper.track_target()
+                    pos = self._stepper.get_pos()
+                    pos = self._inc(pos, self._auto_repeat_level+1)
+                    self._stepper.target(pos)
+                self._refresh = True
+        elif self.button_states.get(BUTTON_TYPES["LEFT"]):
+            if self._auto_repeat_check(delta, True):
+                if self.stepper_mode == StepperMode.SPEED:                      # Speed
+                    speed = self._stepper.get_speed()
+                    speed = self._dec(speed, self._auto_repeat_level+1)
+                    if -_STEPPER_MAX_SPEED > speed:
+                        speed = -_STEPPER_MAX_SPEED
+                    self._stepper.speed(speed)  
+                else:                                                           # Position Mode
+                    if self.stepper_mode != StepperMode.POSITION:
+                        self.stepper_mode.set(StepperMode.POSITION)
+                        self._stepper.speed(_STEPPER_DEFAULT_SPEED)
+                        self._stepper.track_target()
+                    pos = self._stepper.get_pos()
+                    pos = self._dec(pos, self._auto_repeat_level+1)
+                    self._stepper.target(pos)
+                self._refresh = True
+        else:
+            self._auto_repeat_clear()    
+            # non auto-repeating buttons
+            if self.button_states.get(BUTTON_TYPES["CANCEL"]):
+                self.button_states.clear()
+                if self.hexdrive_app is not None:
+                    self._stepper.enable(False)
+                self.current_state = STATE_MENU
+                return
+            elif self.button_states.get(BUTTON_TYPES["CONFIRM"]): #Cycle Through Modes
+                self.button_states.clear()
+                self.stepper_mode.inc()
+                if self.stepper_mode == StepperMode.POSITION:      # Position Mode
+                    self._stepper.speed(_STEPPER_DEFAULT_SPEED)
+                    self._stepper.target(self._stepper.get_pos())
+                    self._stepper.track_target()
+                elif self.stepper_mode == StepperMode.SPEED:        # Speed Mode
+                    self._stepper.speed(0)
+                    self._stepper.free_run(1)
+                else:                                               # Off
+                    self._stepper.stop()
+                self._refresh = True
+                self.notification = Notification(f"  Stepper:\n {self.stepper_mode}")
+                print(f"Stepper:{self.stepper_mode}")
+        if self._refresh:                
+            self._time_since_last_input = 0
+        else:
+            self._time_since_last_input += delta                
+            if self._time_since_last_input > self._timeout_period:
+                self._stepper.stop()
+                self._stepper.speed(0)
+                self._stepper.enable(False)
+                self.current_state = STATE_MENU
+                self.notification = Notification("  Stepper:\n Timeout")
+                print("Stepper:Timeout")            
+            elif self.stepper_mode == StepperMode.SPEED:    # Speed Mode
+                self._refresh = True
+        self._time_since_last_update += delta
+        if self._time_since_last_update > self._keep_alive_period:
+            self._stepper.step()
+            self._time_since_last_update = 0
 
-    def _update_state_servo(self, delta):            
+
+    def _update_state_servo(self, delta: int):            
         # Servo Tester:
         # Up/Down to select Servo
         # Left/Right to adjust position
         if self.button_states.get(BUTTON_TYPES["RIGHT"]):
-            if self._auto_repeat_check(delta, not (self.servo_mode[self.servo_selected] == 3)):
-                if self.servo_mode[self.servo_selected] == 1:    # Trim mode:
+            if self._auto_repeat_check(delta, (self.servo_mode[self.servo_selected] != ServoMode.SCANNING)):
+                if self.servo_mode[self.servo_selected] == ServoMode.TRIM:
                     # adjust the servo centre position
                     self.servo_centre[self.servo_selected] += self._settings['servo_step'].v
                     if  self.servo_centre[self.servo_selected] > (_SERVO_DEFAULT_CENTRE + _SERVO_MAX_TRIM):
@@ -1102,7 +1253,7 @@ class BadgeBotApp(app.App):
                     if self.hexdrive_app is not None:
                         if not self.hexdrive_app.set_servocentre(self.servo_centre[self.servo_selected], self.servo_selected):
                             print("H:Failed to set servo centre")
-                elif self.servo_mode[self.servo_selected] == 3: # Scanning Mode
+                elif self.servo_mode[self.servo_selected] == ServoMode.SCANNING:
                     # as the rate changes sign when it reaches the range, we must be careful to modify it in the correct direction
                     if self.servo_rate[self.servo_selected] < 0:
                         negative = True    
@@ -1120,15 +1271,15 @@ class BadgeBotApp(app.App):
                 else:                                            # Position Mode
                     if  self.servo[self.servo_selected] is None:
                         self.servo[self.servo_selected] = 0
-                    self.servo_mode[self.servo_selected] = 2    
+                    self.servo_mode[self.servo_selected].set(ServoMode.POSITION)    
                     self.servo[self.servo_selected] += self._settings['servo_step'].v
                 if self.servo[self.servo_selected] is not None:
                     if self.servo_range[self.servo_selected] < (self.servo[self.servo_selected] + (self.servo_centre[self.servo_selected] - _SERVO_DEFAULT_CENTRE)):
                         self.servo[self.servo_selected] = self.servo_range[self.servo_selected] - (self.servo_centre[self.servo_selected] - _SERVO_DEFAULT_CENTRE)
                 self._refresh = True
         elif self.button_states.get(BUTTON_TYPES["LEFT"]):
-            if self._auto_repeat_check(delta, not (self.servo_mode[self.servo_selected] == 3)):
-                if self.servo_mode[self.servo_selected] == 1:    # Trim mode:
+            if self._auto_repeat_check(delta, (self.servo_mode[self.servo_selected] != ServoMode.SCANNING)):
+                if self.servo_mode[self.servo_selected] == ServoMode.TRIM:
                     # adjust the servo centre position
                     self.servo_centre[self.servo_selected] -= self._settings['servo_step'].v
                     if  self.servo_centre[self.servo_selected] < (_SERVO_DEFAULT_CENTRE - _SERVO_MAX_TRIM):
@@ -1136,7 +1287,7 @@ class BadgeBotApp(app.App):
                     if self.hexdrive_app is not None:
                         if not self.hexdrive_app.set_servocentre(self.servo_centre[self.servo_selected], self.servo_selected):
                             print("H:Failed to set servo centre")
-                elif self.servo_mode[self.servo_selected] == 3: # Scanning Mode
+                elif self.servo_mode[self.servo_selected] == ServoMode.SCANNING:
                     # as the rate changes sign when it reaches the range, we must be careful to modify it in the correct direction
                     if self.servo_rate[self.servo_selected] < 0:
                         negative = True    
@@ -1154,7 +1305,7 @@ class BadgeBotApp(app.App):
                 else:                                           # Position Mode
                     if  self.servo[self.servo_selected] is None:
                         self.servo[self.servo_selected] = 0                        
-                    self.servo_mode[self.servo_selected] = 2    
+                    self.servo_mode[self.servo_selected].set(ServoMode.POSITION)    
                     self.servo[self.servo_selected] -= self._settings['servo_step'].v
                 if self.servo[self.servo_selected] is not None:
                     if -self.servo_range[self.servo_selected] > (self.servo[self.servo_selected] + (self.servo_centre[self.servo_selected] - _SERVO_DEFAULT_CENTRE)):
@@ -1180,14 +1331,25 @@ class BadgeBotApp(app.App):
                 return
             elif self.button_states.get(BUTTON_TYPES["CONFIRM"]): #Cycle Through Modes
                 self.button_states.clear()
-                self.servo_mode[self.servo_selected] = (self.servo_mode[self.servo_selected] + 1) % 4
-                if self.servo_mode[self.servo_selected] == 0:
+                self.servo_mode[self.servo_selected].inc()
+                if self.servo_mode[self.servo_selected] == ServoMode.OFF:
                     if self.hexdrive_app is not None:
                         self.hexdrive_app.set_servoposition(self.servo_selected, None)
                 else:
                     self._refresh = True
-                self.notification = Notification(f"  Servo {self.servo_selected}:\n {self._servo_modes[self.servo_mode[self.servo_selected]]}")
+                self.notification = Notification(f"  Servo {self.servo_selected}:\n {self.servo_mode[self.servo_selected]}")
         
+        if self._refresh:                
+            self._time_since_last_input = 0
+        else:
+            self._time_since_last_input += delta                
+            if self._time_since_last_input > self._timeout_period:
+                if self.hexdrive_app is not None:
+                    self.hexdrive_app.set_power(False)
+                    self.hexdrive_app.set_servoposition()   # All Off                
+                self.current_state = STATE_MENU
+                self.notification = Notification("  Servo:\n Timeout")   
+
         self._time_since_last_update += delta
         if self._time_since_last_update > self._keep_alive_period:
             self._time_since_last_update = 0
@@ -1195,7 +1357,7 @@ class BadgeBotApp(app.App):
 
         for i in range(self.num_servos):
             _refresh = self._refresh
-            if self.servo_mode[i] == 3:
+            if self.servo_mode[i] == ServoMode.SCANNING:
                 # for any servo set to Scan mode, update the position
                 if self.servo[self.servo_selected] is None:
                     self.servo[self.servo_selected] = 0                        
@@ -1209,12 +1371,12 @@ class BadgeBotApp(app.App):
                     self.servo_rate[i] = -self.servo_rate[i]
                     self.servo[i] = -self.servo_range[i] - (self.servo_centre[i] - _SERVO_DEFAULT_CENTRE)
                 _refresh = True
-            if _refresh and self.hexdrive_app is not None and self.servo_mode[i] != 0 and self.servo[i] is not None:
+            if _refresh and self.hexdrive_app is not None and self.servo_mode[i] != ServoMode.OFF and self.servo[i] is not None:
                 # scanning servo or the selected servo
                 self.hexdrive_app.set_servoposition(i, int(self.servo[i]))
 
 
-    def _update_state_settings(self, delta):    
+    def _update_state_settings(self, delta: int):    
         if self.button_states.get(BUTTON_TYPES["UP"]):
             if self._auto_repeat_check(delta, False):
                 self._edit_setting_value = self._settings[self._edit_setting].inc(self._edit_setting_value, self._auto_repeat_level)
@@ -1243,7 +1405,7 @@ class BadgeBotApp(app.App):
                 # leave setting unchanged
                 if self._settings['logging'].v:
                     print(f"Setting: {self._edit_setting} Cancelled")
-                self.set_menu(_main_menu_items[2])
+                self.set_menu(_main_menu_items[3])
                 self.current_state = STATE_MENU
             elif self.button_states.get(BUTTON_TYPES["CONFIRM"]):
                 self.button_states.clear()
@@ -1253,7 +1415,7 @@ class BadgeBotApp(app.App):
                 self._settings[self._edit_setting].v = self._edit_setting_value
                 self._settings[self._edit_setting].persist()
                 self.notification = Notification(f"  Setting:   {self._edit_setting}={self._edit_setting_value}")
-                self.set_menu(_main_menu_items[2])
+                self.set_menu(_main_menu_items[3])
                 self.current_state = STATE_MENU
 
 
@@ -1263,8 +1425,8 @@ class BadgeBotApp(app.App):
             clear_background(ctx)   
             ctx.save()
             ctx.font_size = label_font_size
-            if ctx.text_align != ctx.LEFT:             
-                print(f"H:Font alignment {ctx.text_align}!")
+            if ctx.text_align != ctx.LEFT:
+                # See https://github.com/emfcamp/badge-2024-software/issues/181             
                 ctx.text_align = ctx.LEFT
             ctx.text_baseline = ctx.BOTTOM            
             if self.current_state == STATE_LOGO:
@@ -1317,6 +1479,8 @@ class BadgeBotApp(app.App):
                 button_labels(ctx, confirm_label="Replay", cancel_label="Restart")
             elif self.current_state == STATE_SERVO:
                 self._draw_state_servo(ctx)
+            elif self.current_state == STATE_STEPPER:
+                self._draw_state_stepper(ctx)                
             elif self.current_state == STATE_SETTINGS:
                 self.draw_message(ctx, ["Edit Setting",f"{self._edit_setting}:",f"{self._edit_setting_value}"], [(1,1,1),(0,0,1),(0,1,0)], label_font_size)
                 button_labels(ctx, up_label="+", down_label="-", confirm_label="Set", cancel_label="Cancel", right_label="Default")
@@ -1355,6 +1519,51 @@ class BadgeBotApp(app.App):
             ctx.rgb(*colour).move_to(H_START, V_START + label_font_size * (self.scroll_offset + i_num)).text(str(instr))
 
 
+    def _draw_state_stepper(self, ctx):
+        stepper_text         = ["S"]*(1+self.num_steppers)              # Servo Text
+        stepper_text_colours = [(0.4,0.0,0.0)]*(1+self.num_steppers)    # Red
+        stepper_text[0]      = "Stepper Test"
+        stepper_text_colours[0] = (1,1,1)                       # Title - White
+        if self._stepper is not None:
+            i = 0
+            # Select Colour according to mode
+            if self.stepper_mode == StepperMode.OFF:
+                body_colour = (0.2,0.2,0.2)                    # Not activated - Grey
+                bar_colour  = (0.4,0.4,0.4)                    # Not activated - Grey
+            else:
+                body_colour = (0.1,0.1,0.5)                    # Active - Blue                    
+                bar_colour  = (0.1,0.1,1.0)                    # Active - Blue
+                stepper_text_colours[1] = (0.4,0.4,0.0)        # Active - Yellow                        
+
+            # draw the servo positions
+            ctx.save()
+            # y = i-1.5 for 4 servos, y = i-0.5 for 2 servos
+            ctx.translate(0, (i-(self.num_steppers/2)+0.5) * label_font_size)
+            # background for the servo position - grey
+            background_colour = (0.15,0.15,0.15)                        
+            ctx.rgb(*background_colour).rectangle(-100,1,200,label_font_size-2).fill() 
+            c = 0
+            # draw the stepper position (based on a centre halfway through the range)
+            x = 200 * (self._stepper.get_pos() / self._settings['step_max_pos'].v) - 100
+            # vertical bar at stepper position
+            ctx.rgb(*bar_colour).rectangle(x-2,1,5,label_font_size-2).fill()
+            # horizontal bar from 0 to stepper position, not covering the centre marker or the stepper position bar
+            ctx.rgb(*body_colour)                        
+            if   x > (c+4):
+                ctx.rectangle(c+1, 3, x-c-4, label_font_size-6).fill()
+            elif x < (c-4):
+                ctx.rectangle(x+4, 3, c-x-4, label_font_size-6).fill()
+            # marker for the centre - black (drawn last as it may have to go through the servo position bar)
+            ctx.rgb(0,0,0).move_to(c,0).line_to(c,label_font_size).stroke()                            
+            ctx.restore()
+            if self.stepper_mode == StepperMode.SPEED:                              # Speed
+                stepper_text[i+1] = f"{int(self._stepper.get_speed()):4}/s"   # Speed in steps per second
+            else:                                                   # Position
+                stepper_text[i+1] = "Off" if (self.stepper_mode == StepperMode.OFF) else f"{int(self._stepper.get_pos()):+6} "
+        self.draw_message(ctx, stepper_text, stepper_text_colours, label_font_size)
+        button_labels(ctx, confirm_label="Mode", cancel_label="Exit", left_label="<--", right_label="-->")
+
+
     def _draw_state_servo(self, ctx):                 
         servo_text         = ["S"]*(1+self.num_servos)              # Servo Text
         servo_text_colours = [(0.4,0.0,0.0)]*(1+self.num_servos)    # Red
@@ -1363,10 +1572,10 @@ class BadgeBotApp(app.App):
         for i in range(self.num_servos):
 
             # Select Colour according to mode
-            if self.servo[i] is None or self.servo_mode[i] == 0:
+            if self.servo[i] is None or self.servo_mode[i] == ServoMode.OFF:
                 body_colour = (0.2,0.2,0.2)                    # Not activated - Grey
                 bar_colour  = (0.4,0.4,0.4)                    # Not activated - Grey
-            elif self.servo_mode[i] == 3:
+            elif self.servo_mode[i] == ServoMode.SCANNING:
                 body_colour = (0.1,0.5,0.1)                    # Scanning - Green 
                 bar_colour  = (0.1,1.0,0.1)                    # Scanning - Green
                 servo_text_colours[1+i] = (0.4,0.0,0.4)        # Scanning - Magenta
@@ -1399,17 +1608,17 @@ class BadgeBotApp(app.App):
             # marker for the centre - black (drawn last as it may have to go through the servo position bar)
             ctx.rgb(0,0,0).move_to(c,0).line_to(c,label_font_size).stroke()                            
             ctx.restore()
-            if self.servo_mode[i] == 3:
+            if self.servo_mode[i] == ServoMode.SCANNING:
                 servo_text[i+1] = f"{int(abs(self.servo_rate[i])):4}/s"   # Scanning Rate
             else:                                                   # Position
-                servo_text[i+1] = "Off" if (self.servo[i] is None or self.servo_mode[i] == 0) else f"{int(self.servo[i]):+5} "
+                servo_text[i+1] = "Off" if (self.servo[i] is None or self.servo_mode[i] == ServoMode.OFF) else f"{int(self.servo[i]):+5} "
         # Selected Servo - Brighter Text
         servo_text_colours[1+self.servo_selected] = tuple(int(j * 2.5) for j in servo_text_colours[1+self.servo_selected])                            
         self.draw_message(ctx, servo_text, servo_text_colours, label_font_size)
-        if self.servo_mode[self.servo_selected] == 3:
+        if self.servo_mode[self.servo_selected] == ServoMode.SCANNING:
             # Scanning mode
             button_labels(ctx, up_label="^", down_label="\u25BC", confirm_label="Mode", cancel_label="Exit", left_label="Slower", right_label="Faster")
-        elif self.servo_mode[self.servo_selected] == 1:
+        elif self.servo_mode[self.servo_selected] == ServoMode.TRIM:
             button_labels(ctx, up_label="^", down_label="\u25BC", confirm_label="Mode", cancel_label="Exit", left_label="Trim-", right_label="+Trim")
         else:
             #Position mode
@@ -1418,7 +1627,7 @@ class BadgeBotApp(app.App):
 
 
     # Value increment/decrement functions for positive integers only
-    def _inc(self, v, l):
+    def _inc(self, v: int, l: int):
         if l==0:
             return v+1
         else:
@@ -1426,7 +1635,7 @@ class BadgeBotApp(app.App):
             v = ((v // d) + 1) * d   # round up to the next multiple of 10^l
             return v
     
-    def _dec(self, v, l):
+    def _dec(self, v: int, l: int):
         if l==0:
             return v-1
         else:
@@ -1483,6 +1692,7 @@ class BadgeBotApp(app.App):
             # leave the servo modes as they are
         self.servo_selected = 0
         self._time_since_last_update = 0
+        self._time_since_last_input = 0
 
 
 
@@ -1505,9 +1715,11 @@ class BadgeBotApp(app.App):
             # construct the main menu based on template
             menu_items = _main_menu_items.copy()
             if self.num_servos == 0:
-                menu_items.remove("Servo Test")   
+                menu_items.remove(_main_menu_items[2])   
+            if self.num_steppers == 0:
+                menu_items.remove(_main_menu_items[1])   
             if self.num_motors == 0:
-                menu_items.remove("Motor Moves")
+                menu_items.remove(_main_menu_items[0])
             self.menu = Menu(
                     self,
                     menu_items,
@@ -1528,7 +1740,7 @@ class BadgeBotApp(app.App):
 
 
     # this appears to be able to be called at any time
-    def _main_menu_select_handler(self, item, idx):
+    def _main_menu_select_handler(self, item: str, idx: int):
         if self._settings['logging'].v:
             print(f"H:Main Menu {item} at index {idx}")
         if   item == _main_menu_items[0]: # Motor Test - Turtle/Logo mode
@@ -1542,7 +1754,29 @@ class BadgeBotApp(app.App):
                 self._animation_counter = 0
                 self.current_state = STATE_HELP
                 self._refresh = True
-        elif item == _main_menu_items[1]: # Servo Test
+        elif item == _main_menu_items[1]: # Stepper Test
+            if self.num_steppers == 0:
+                self.notification = Notification("No Steppers")
+            else:
+                if self._stepper is None:
+                    # try timer IDs 0-3 until one is free
+                    for i in range(4):
+                        try: 
+                            self._stepper = Stepper(self, self.hexdrive_app, step_size=1, timer_id=i, max_pos=self._settings['step_max_pos'].v)
+                            break
+                        except:
+                            pass
+                if self._stepper is None:
+                    self.notification = Notification("No Free Timers")
+                else:
+                    self.set_menu(None)
+                    self.button_states.clear()                    
+                    self.current_state = STATE_STEPPER 
+                    self._refresh = True
+                    self._auto_repeat_clear()
+                    self._stepper.enable(True)
+                    self._time_since_last_input = 0                                       
+        elif item == _main_menu_items[2]: # Servo Test
             if self.num_servos == 0:
                 self.notification = Notification("No Servos")
             else:
@@ -1552,24 +1786,24 @@ class BadgeBotApp(app.App):
                 self.current_state = STATE_SERVO
                 self._refresh = True
                 self._auto_repeat_clear()
-        elif item == _main_menu_items[2]: # Settings
-            self.set_menu(_main_menu_items[2])
-        elif item == _main_menu_items[3]: # About
+        elif item == _main_menu_items[3]: # Settings
+            self.set_menu(_main_menu_items[3])
+        elif item == _main_menu_items[4]: # About
             self.set_menu(None)
             self.button_states.clear()
             self._animation_counter = 0
             self.current_state = STATE_LOGO
             self._refresh = True   
-        elif item == _main_menu_items[4]: # Exit
+        elif item == _main_menu_items[5]: # Exit
             eventbus.remove(HexpansionInsertionEvent, self._handle_hexpansion_insertion, self)
             eventbus.remove(HexpansionRemovalEvent, self._handle_hexpansion_removal, self)
             eventbus.remove(RequestForegroundPushEvent, self._gain_focus, self)
             eventbus.remove(RequestForegroundPopEvent, self._lose_focus, self)
             eventbus.emit(RequestStopAppEvent(self))
 
-    def _settings_menu_select_handler(self, item, idx):
+    def _settings_menu_select_handler(self, item: str, idx: int):
         if self._settings['logging'].v:
-            print(f"H:Setting {item} at index {idx}")
+            print(f"H:Setting {item} @ {idx}")
         if idx == 0: #Save
             if self._settings['logging'].v:
                 print("H:Settings Save All")
@@ -1616,7 +1850,7 @@ class BadgeBotApp(app.App):
     # multi level auto repeat
     # if speed_up is True, the auto repeat gets faster the longer the button is held
     # otherwise it is a fixed rate, but the level is used to determine the scale of the increase in the setttings inc() and dec() functions
-    def _auto_repeat_check(self, delta, speed_up = True) -> bool:                
+    def _auto_repeat_check(self, delta: int, speed_up: bool = True) -> bool:                
         self._auto_repeat += delta
         # multi stage auto repeat - the repeat gets faster the longer the button is held
         if self._auto_repeat > self._auto_repeat_intervals[self._auto_repeat_level if speed_up else 0]:
@@ -1655,7 +1889,7 @@ class BadgeBotApp(app.App):
         self.power_plan_iter = iter([])
 
 
-    def get_current_power_level(self, delta) -> int:
+    def get_current_power_level(self, delta: int) -> int:
         # takes in delta as ms since last call
         # if delta was > 10... what to do
         if delta >= _TICK_MS:
@@ -1687,13 +1921,214 @@ class BadgeBotApp(app.App):
             self.current_instruction = None
 
 
+######## STEPPER MOTOR CLASS ########
+
+class Stepper:
+    def __init__(self, container, hexdrive_app, step_size: int = 1, steps_per_rev: int = _STEPPER_DEFAULT_SPR, speed_sps: int = _STEPPER_DEFAULT_SPEED, max_sps: int = _STEPPER_MAX_SPEED, max_pos: int = _STEPPER_MAX_POSITION, timer_id: int = 0):
+        self._container = container 
+        self._hexdrive_app = hexdrive_app
+        self._phase = 0
+        self._calibrated = False
+        self._timer = Timer(timer_id)
+        self._timer_is_running = False
+        self._timer_mode = 0
+        self._free_run_mode = 0                     # direction of free run mode
+        self._enabled = False
+        self._target_pos = 0
+        self._pos = 0                               # current position in half steps
+        self._max_sps = int(max_sps)                # max speed in full steps per second
+        self._steps_per_sec = int(speed_sps)        # current speed in full steps per second
+        self._steps_per_rev = int(steps_per_rev)    # full steps per revolution
+        self._max_pos = 2*int(max_pos)              # max position stored in half steps
+        self._freq = 0
+        self._min_period = 0
+        self._step_size = int(step_size)            # 1 = half steps, 2 = full steps
+        self._last_step_time = 0    
+        self.track_target()
+        
+    def step_size(self,sz=1):
+        if sz < 1:
+            sz = 1
+        elif sz > 2:
+            sz = 2
+        self._step_size = int(sz)
+
+    def speed(self,sps):    # speed in FULL steps per second
+        if self._free_run_mode == 1 and sps < 0:
+            self._free_run_mode = -1
+        elif self._free_run_mode == -1 and sps > 0:
+            self._free_run_mode = 1
+        if sps > self._max_sps:
+            sps = self._max_sps
+        elif sps < -self._max_sps:
+            sps = -self._max_sps
+        self._steps_per_sec = int(sps)
+        self._update_timer((2//self._step_size)*abs(self._steps_per_sec))    # steps per second
+
+    def speed_rps(self,rps):
+        self.speed(rps*self._steps_per_rev)
+
+    def get_speed(self) -> int:
+        return self._steps_per_sec
+
+    def target(self,t):
+        if self._calibrated and t < 0:
+            # when already calibrated limit to 0
+            self._target_pos = 0
+        elif self._calibrated and (2*int(t)) > self._max_pos:
+            # when already calibrated limit to max
+            self._target_pos = self._max_pos
+        else:
+            self._target_pos = 2*int(t)
+
+    def target_deg(self,deg):
+        self.target(self._steps_per_rev*deg/360.0)  # target pos is in steps
+    
+    def target_rad(self,rad):
+        self.target(self._steps_per_rev*rad/(2*pi)) # target pos is in steps
+    
+    def get_pos(self) -> int:
+        return (self._pos//2)   # convert half steps to full steps
+    
+    def get_pos_deg(self) -> float:
+        return self._pos*180.0/self._steps_per_rev      # half steps to degrees
+    
+    def get_pos_rad(self) -> float:
+        return self._pos*pi/self._steps_per_rev         # half steps to radians
+    
+    def overwrite_pos(self,p=0):
+        self._pos = 2*int(p)    # convert full steps to half steps
+    
+    def overwrite_pos_deg(self,deg):
+        self._pos = deg*self._steps_per_rev/180.0      # degrees to half steps
+    
+    def overwrite_pos_rad(self,rad):
+        self._pos = rad*self._steps_per_rev/pi         # radians to half steps
+
+    def step(self,d=0):
+        cur_time = time.ticks_ms()
+        if time.ticks_diff(cur_time, self._last_step_time) < self._min_period:
+            # avoid stepping too quickly as this causes skipped steps
+            return
+        self._last_step_time = cur_time
+        if d>0:
+            self._pos+=self._step_size
+            self._phase = (self._phase-self._step_size)%_STEPPER_NUM_PHASES
+        elif d<0:
+            self._pos-=self._step_size
+            self._phase = (self._phase+self._step_size)%_STEPPER_NUM_PHASES
+        # Check position limits
+        if self._calibrated and self._pos < 0:
+            print("s/w min endstop")
+            self._pos = 0
+            self.speed(0)
+            return
+        elif self._calibrated and self._pos > self._max_pos:
+            print("s/w max endstop")
+            self._pos = self._max_pos
+            self.speed(0)
+            return
+        try:
+            self._hexdrive_app.motor_step(self._phase)
+        except Exception as e:                       
+            print(f"step phase {self._phase} failed:{e}")
+
+    def _hit_endstop(self):             
+        print("Endstop - hit")
+        if not self._calibrated:
+            self._calibrated = True
+        # set this as the new zero position
+        self.overwrite_pos(0)
+        # if we were moving towards the endstop, stop
+        if self._free_run_mode < 0:
+            self.speed(0)
+        elif self._free_run_mode == 0 and self._target_pos < self._pos:
+            self.speed(0)
+
+    def _timer_callback_fwd(self,t):
+        self.step(1)
+
+    def _timer_callback_rev(self,t):
+        self.step(-1)
+
+    def _timer_callback(self,t):
+        if self._target_pos>self._pos:
+            self.step(1)
+        elif self._target_pos<self._pos:
+            self.step(-1)
+
+    def free_run(self,d=1):
+        self._free_run_mode=d
+        if d!=0:
+            self._update_timer((2//self._step_size)*abs(self._steps_per_sec))   # half steps per second
+
+    def track_target(self):
+        self._free_run_mode=0
+        self._update_timer((2//self._step_size)*abs(self._steps_per_sec))      # half steps per second
+
+    def _update_timer(self,freq):
+        if self._timer_is_running and freq != self._freq:
+            try:
+                self._timer.deinit()
+                self._freq = 0
+                self._timer_is_running=False
+            except Exception as e:
+                print(f"update_timer failed:{e}")
+        if 0 != freq and (freq != self._freq or self._free_run_mode != self._timer_mode):
+            try:                
+                print(f"Timer: {freq}Hz")
+                if self._free_run_mode>0:
+                    self._timer.init(freq=freq,callback=self._timer_callback_fwd)
+                elif self._free_run_mode<0:
+                    self._timer.init(freq=freq,callback=self._timer_callback_rev)
+                else:
+                    self._timer.init(freq=freq,callback=self._timer_callback)
+                self._freq = freq
+                self._min_period = (1000//freq) - 1
+                self._timer_is_running=True
+                self._timer_mode = self._free_run_mode
+            except Exception as e:
+                print(f"update_timer failed:{e}")
+        elif freq == 0:
+            print("Timer: 0Hz")
+
+
+    def stop(self):
+        self._update_timer(0)
+        try:
+            self._hexdrive_app.motor_release()
+        except Exception as e:
+            print(f"stop failed:{e}")
+
+    def enable(self,e = True):
+        self._enabled=e
+        try:
+            if e:
+                if self._free_run_mode!=0:
+                    self._update_timer((2//self._step_size)*abs(self._steps_per_sec))   # half steps per second                
+                self._hexdrive_app.motor_step(self._phase)
+            else:
+                self._update_timer(0)
+                self._hexdrive_app.motor_release()
+            self._hexdrive_app.set_power(e)
+        except Exception as e:
+            print(f"enable failed:{e}")
+
+    def is_enabled(self) -> bool:
+        return self._enabled
+    
+########## END OF STEPPER CLASS ##########
+
+
+
 class HexDriveType:
-    def __init__(self, pid, vid=0xCAFE, motors=0, servos=0, name="Unknown"):
+    def __init__(self, pid, vid = 0xCAFE, motors = 0, steppers = 0, servos = 0, name ="Unknown"):
         self.vid = vid
         self.pid = pid
         self.name = name
         self.motors = motors
         self.servos = servos
+        self.steppers = steppers
 
 
 class MySetting:
@@ -1779,7 +2214,7 @@ class MySetting:
 class Instruction:
     def __init__(self, press_type: Button) -> None:
         self._press_type = press_type
-        self._duration: int = 1
+        self._duration = 1
         self.power_plan = []
 
 
