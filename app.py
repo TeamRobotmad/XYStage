@@ -29,9 +29,10 @@ _APP_VERSION = "1.0" # XYStage App Version Number
 
 
 # Stepper Tester - Defaults
-_STEPPER_MAX_SPEED     = 1100*32    # full steps per second
-_STEPPER_MIN_SPEED     = 20*32      # full steps per second
-_STEPPER_MAX_POSITION  = 3100       # full steps from h/w endstop to s/w endstop at the other end
+_STEPPER_MAX_SPEED          = 1000*32    # steps per second
+_STEPPER_MIN_SPEED          = 10*32      # steps per second
+_STEPPER_MAX_ACCELERATION   = 100*32     # steps per second per update
+_STEPPER_MAX_POSITION       = 3100       # steps from h/w endstop to s/w endstop at the other end
 
 # Timings
 _AUTO_REPEAT_MS = 200       # Time between auto-repeats, in ms
@@ -108,6 +109,7 @@ class XYStageApp(app.App):
         self._settings['YRange']        = MySetting(self._settings, _YRANGE_DEFAULT, 10, 100000)
         self._settings['min_speed']     = MySetting(self._settings, _STEPPER_MIN_SPEED, 10, 10000)
         self._settings['max_speed']     = MySetting(self._settings, _STEPPER_MAX_SPEED, 10, 100000)
+        self._settings['acceleration']  = MySetting(self._settings, _STEPPER_MAX_ACCELERATION, 10, 10000)
 
         self._edit_setting: int  = None
         self._edit_setting_value = None       
@@ -151,6 +153,9 @@ class XYStageApp(app.App):
         # Overall app state (controls what is displayed and what user inputs are accepted)
         self.current_state = STATE_INIT
         self.previous_state = self.current_state
+        self._target = {}
+        self._target['x'] = 0
+        self._target['y'] = 0   
         if self._settings['logging'].v:
             print("XYStageApp:Init")
 
@@ -268,23 +273,12 @@ class XYStageApp(app.App):
         elif self.current_state == STATE_XYSTAGE:
             self._update_state_xystage(delta)
 
-    ### Stepper Tester Application ###
-        elif self.current_state == STATE_STEPPER:
-            self._update_state_stepper(delta)
-
     ### Settings Capability ###
         elif self.current_state == STATE_SETTINGS:
             self._update_state_settings(delta)
     ### End of Update ###
 
-    def _get_speed_from_disance(self, distance: int) -> int:
-        # calculate the speed required to move the distance in 2 second
-        # subject to obeying the min and max speed limits
-        speed = int((distance) // 2)
-        return max(self._settings['min_speed'].v, min(speed, self._settings['max_speed'].v))
-
-
-    # Stepper Tester:
+    # XY Stage Control
     def _update_state_xystage(self, delta: int):
         self.xystage['x'] = self._stepperX.get_pos(delta) - self._settings['XRange'].v//2        
         self.xystage['y'] = self._stepperY.get_pos(delta) - self._settings['YRange'].v//2        
@@ -298,16 +292,16 @@ class XYStageApp(app.App):
             # if value is too high then apply -ve speed
             # if value is too low then apply +ve speed
             # subject to the min and max speed limits
-            if self.xystage['x'] > (0 + POSITION_MATCH_TOLERANCE):
-                self._stepperX.speed(-self._get_speed_from_disance(abs(self.xystage['x'])))
-            elif self.xystage['x'] < (0 - POSITION_MATCH_TOLERANCE):
-                self._stepperX.speed(self._get_speed_from_disance(abs(self.xystage['x'])))
+            if self.xystage['x'] > (self._target['x'] + POSITION_MATCH_TOLERANCE):
+                self._stepperX.speed(-self._stepperX.get_speed_from_disance((self._target['x']-self.xystage['x'])))
+            elif self.xystage['x'] < (self._target['x'] - POSITION_MATCH_TOLERANCE):
+                self._stepperX.speed(self._stepperX.get_speed_from_disance((self._target['x']-self.xystage['x'])))
             else:
                 self._stepperX.speed(0)
-            if self.xystage['y'] > (0 + POSITION_MATCH_TOLERANCE):
-                self._stepperY.speed(-self._get_speed_from_disance(abs(self.xystage['y'])))
-            elif self.xystage['y'] < (0 - POSITION_MATCH_TOLERANCE):
-                self._stepperY.speed(self._get_speed_from_disance(abs(self.xystage['y'])))
+            if self.xystage['y'] > (self._target['y'] + POSITION_MATCH_TOLERANCE):
+                self._stepperY.speed(-self._stepperY.get_speed_from_disance((self._target['y']-self.xystage['y'])))
+            elif self.xystage['y'] < (self._target['y'] - POSITION_MATCH_TOLERANCE):
+                self._stepperY.speed(self._stepperY.get_speed_from_disance((self._target['y']-self.xystage['y'])))
             else:
                 self._stepperY.speed(0)
             self._refresh = True
@@ -571,12 +565,12 @@ class XYStageApp(app.App):
                                 pins["en"]   = self._hexpansion_config.ls_pin[X_ENABLE]
                                 pins["step"] = self._hexpansion_config.pin[X_STEP]
                                 pins["stop"] = self._hexpansion_config.pin[X_ENDSTOP]
-                                self._stepperX = Stepper(self, pins, reverse = True, name = "X", max_sps = self._settings['max_speed'].v, max_pos=self._settings['XRange'].v)
+                                self._stepperX = Stepper(self, pins, initial_pos = self._settings['XRange'].v//2, reverse = True, name = "X", max_sps = self._settings['max_speed'].v, max_pos=self._settings['XRange'].v, max_sps_change = self._settings['acceleration'].v)
                                 if self._settings['logging'].v:
                                     print(f"StepperX:Init {i}")
                                 continue
-                            except:
-                                print(f"StepperX:Init {i} Failed")
+                            except Exception as e:
+                                print(f"StepperX:Init {i} Failed {e}")
                                 pass
                         elif self._stepperY is None:
                             try:
@@ -586,13 +580,13 @@ class XYStageApp(app.App):
                                 pins["en"]   = self._hexpansion_config.ls_pin[Y_ENABLE]
                                 pins["step"] = self._hexpansion_config.pin[Y_STEP]
                                 pins["stop"] = self._hexpansion_config.pin[Y_ENDSTOP]                                
-                                self._stepperY = Stepper(self, pins, name = "Y", max_sps = self._settings['max_speed'].v, max_pos=self._settings['YRange'].v)
+                                self._stepperY = Stepper(self, pins, initial_pos = self._settings['YRange'].v//2, name = "Y", max_sps = self._settings['max_speed'].v, max_pos=self._settings['YRange'].v, max_sps_change = self._settings['acceleration'].v)
                                 if self._settings['logging'].v:
                                     print(f"StepperY:Init {i}")
                                 # Start off assuming stage is in last known position
                                 continue
-                            except:
-                                print(f"StepperY:Init {i} Failed")
+                            except Exception as e:
+                                print(f"StepperY:Init {i} Failed {e}")
                                 pass
                         else:
                             break
@@ -693,40 +687,63 @@ class XYStageApp(app.App):
 ######## STEPPER MOTOR CLASS ########
 
 class Stepper:  # External Driver DRV8825
-    def __init__(self, container, pins, reverse = False, name: str = "", max_sps: int = _STEPPER_MAX_SPEED, max_pos: int = _STEPPER_MAX_POSITION):
-        self._container = container
-        self._name = name 
-        self._calibrated = False
-        #self._timer = Timer(timer_id)
-        self._timer_is_running = False
-        self._timer_mode = 0
-        self._pos = 0                               # current position in steps
-        self._free_run_mode = 1                     # direction of free run mode
-        self._enabled = False
-        self._reverse = reverse
-        self._max_sps_change = int(max_sps/10)      # max change in speed in steps per second per update
-        self._max_sps = int(max_sps)                # max speed in steps per second
-        self._steps_per_sec = 0                     # current speed in steps per second
-        self._max_pos = int(max_pos)                # max position stored in half steps
-        self._freq = 0
+    def __init__(self, container, pins, initial_pos: int = 0, reverse = False, name: str = "", max_sps_change: int = _STEPPER_MAX_ACCELERATION, max_sps: int = _STEPPER_MAX_SPEED, max_pos: int = _STEPPER_MAX_POSITION):
+        try:
+            self._container = container
+            self._name = name
+            self._reverse = reverse                     # reverse direction of stepper at hardware level
+            self._max_sps_change = int(max_sps_change)  # max change in speed in steps per second per update
+            self._max_sps = int(max_sps)                # max speed in steps per second
+            self._max_pos = int(max_pos)                # max position stored in steps        
+            self._steps_per_sec = 0                     # current speed in steps per second
+            self._calibrated = False
+            self._timer_mode = 0
+            self._pos = initial_pos                     # current position in steps
+            self._free_run_mode = 1                     # direction of free run mode
+            self._enabled = False
+            self._freq = 0
+            self._updates_per_sec = 10
 
-        # Pins for external stepper driver
-        self._pins = pins
-        self._pins["en"].init(mode=Pin.OUT)
-        self._pins["en"].on()   # active low
-        self._pins["dir"].init(mode=Pin.OUT)
-        self._pins["dir"].off()
-        self._pins["step"].init(mode=Pin.OUT)
-        self._pins["step"].off()
-        self._pins["stop"].init(mode=Pin.IN, pull=Pin.PULL_UP)
-        self._pins["stop"].irq(trigger=Pin.IRQ_FALLING, handler=self._hit_endstop)
+            # Pins for external stepper driver
+            self._pins = pins
+            self._pins["en"].init(mode=Pin.OUT)
+            self._pins["en"].on()   # active low
+            self._pins["dir"].init(mode=Pin.OUT)
+            self._pins["dir"].off()
+            self._pins["step"].init(mode=Pin.OUT)
+            self._pins["step"].off()
+            self._pins["stop"].init(mode=Pin.IN, pull=Pin.PULL_UP)
+            self._pins["stop"].irq(trigger=Pin.IRQ_FALLING, handler=self._hit_endstop)
+        except Exception as e:
+            print(f"{self._name} Init failed:{e}")
 
         # Setup PWM output on the step pin
         try:
-            self._pwm = PWM(self._pins["step"], freq=10, duty_ns=2000)    # 0 Hz is invalid but 0 duty is allowed
+            self._pwm = PWM(self._pins["step"], freq=10, duty_ns=0)    # 0 Hz is invalid but 0 duty is allowed
         except Exception as e:
             print(f"{self._name} PWM failed:{e}")
   
+  
+    def get_speed_from_disance(self, distance: int) -> int:
+        # function to calculate the speed that we need to reach the target as quickly as possible
+        # subject to the max speed (max_sps) and acceleration (max_sps_change) settings, and the distance to the target and the current speed (sps)
+        # s = ut + 0.5*at^2
+        # v^2 = u^2 + 2as
+        # calculate stopping distance at current speed
+        # s = 0.5 * (u^2) / a
+        steps_to_stop = int((self._steps_per_sec ** 2) / (2 * (self._max_sps_change * self._updates_per_sec)))
+        print(f"{self._name}:{time.ticks_ms():6d}:Steps to stop:{steps_to_stop}/{distance}")
+        if abs(distance) <= (steps_to_stop + (self._steps_per_sec//self._updates_per_sec)):
+            # if we are already close to the target, then stop
+            # we can return min target speed as the speed control will enforce the max acceleration
+            return self._container._settings['min_speed'].v
+        elif abs(distance) <= (steps_to_stop + ((self._steps_per_sec + 2*self._max_sps_change)//self._updates_per_sec)):
+            # we can't affored to increase the speed as we will overshoot the target
+            return self._steps_per_sec
+        else:
+            # we can increase the speed (if not already at max speed)
+            return self._max_sps
+    
     def speed(self,sps) -> bool:    # speed in FULL steps per second
         if self._free_run_mode == 1 and sps < 0:
             self._free_run_mode = -1
@@ -779,11 +796,11 @@ class Stepper:  # External Driver DRV8825
         # Check if we have hit the end stop
         if self._calibrated:
             if self._pos < 0 and self._steps_per_sec < 0:
-                if self._settings['logging'].v:
+                if self._container._settings['logging'].v:
                     print(f"{self._name} s/w min endstop")
                 self.speed(0)
             elif self._pos > self._max_pos and self._steps_per_sec > 0:
-                if self._settings['logging'].v:
+                if self._container._settings['logging'].v:
                     print(f"{self._name} s/w max endstop")
                 self.speed(0)        
         return self._pos 
@@ -792,7 +809,7 @@ class Stepper:  # External Driver DRV8825
         # double check the endstop is hit
         # if not, ignore the interrupt
         if pin.value() == 0:  
-            if self._settings['logging'].v:
+            if self._container._settings['logging'].v:
                 print(f"{self._name} Endstop - hit")
             if not self._calibrated:
                 self._calibrated = True
@@ -810,7 +827,7 @@ class Stepper:  # External Driver DRV8825
             self._freq = 0   
         elif freq != self._freq or self._free_run_mode != self._timer_mode:
             try:                
-                if self._settings['logging'].v:
+                if self._container._settings['logging'].v:
                     print(f"{self._name} Timer:{self._free_run_mode} {freq}Hz")
                 if self._free_run_mode>0:
                     self._pins["dir"].value(1 if self._reverse else 0)
@@ -826,7 +843,6 @@ class Stepper:  # External Driver DRV8825
                     self._pins["en"].on()
                     self._pwm.duty_ns(0)        # stop the PWM (frequency of 0 is not allowed)   
                 self._freq = freq
-                self._timer_is_running=True
                 self._timer_mode = self._free_run_mode
             except Exception as e:
                 print(f"{self._name} update_timer failed:{e}")
@@ -851,206 +867,6 @@ class Stepper:  # External Driver DRV8825
         return self._enabled
     
 ########## END OF STEPPER CLASS ##########
-
-######## STEPPER MOTOR CLASS ########
-
-class Stepper:
-    def __init__(self, container, hexdrive_app, step_size: int = 1, steps_per_rev: int = _STEPPER_DEFAULT_SPR, speed_sps: int = _STEPPER_DEFAULT_SPEED, max_sps: int = _STEPPER_MAX_SPEED, max_pos: int = _STEPPER_MAX_POSITION, timer_id: int = 0):
-        self._container = container 
-        self._hexdrive_app = hexdrive_app
-        self._phase = 0
-        self._calibrated = False
-        self._timer = Timer(timer_id)
-        self._timer_is_running = False
-        self._timer_mode = 0
-        self._free_run_mode = 0                     # direction of free run mode
-        self._enabled = False
-        self._target_pos = 0
-        self._pos = 0                               # current position in half steps
-        self._max_sps = int(max_sps)                # max speed in full steps per second
-        self._steps_per_sec = int(speed_sps)        # current speed in full steps per second
-        self._steps_per_rev = int(steps_per_rev)    # full steps per revolution
-        self._max_pos = 2*int(max_pos)              # max position stored in half steps
-        self._freq = 0
-        self._min_period = 0
-        self._step_size = int(step_size)            # 1 = half steps, 2 = full steps
-        self._last_step_time = 0    
-        self.track_target()
-        
-    def step_size(self,sz=1):
-        if sz < 1:
-            sz = 1
-        elif sz > 2:
-            sz = 2
-        self._step_size = int(sz)
-
-    def speed(self,sps):    # speed in FULL steps per second
-        if self._free_run_mode == 1 and sps < 0:
-            self._free_run_mode = -1
-        elif self._free_run_mode == -1 and sps > 0:
-            self._free_run_mode = 1
-        if sps > self._max_sps:
-            sps = self._max_sps
-        elif sps < -self._max_sps:
-            sps = -self._max_sps
-        self._steps_per_sec = int(sps)
-        self._update_timer((2//self._step_size)*abs(self._steps_per_sec))    # steps per second
-
-    def speed_rps(self,rps):
-        self.speed(rps*self._steps_per_rev)
-
-    def get_speed(self) -> int:
-        return self._steps_per_sec
-
-    def target(self,t):
-        if self._calibrated and t < 0:
-            # when already calibrated limit to 0
-            self._target_pos = 0
-        elif self._calibrated and (2*int(t)) > self._max_pos:
-            # when already calibrated limit to max
-            self._target_pos = self._max_pos
-        else:
-            self._target_pos = 2*int(t)
-
-    def target_deg(self,deg):
-        self.target(self._steps_per_rev*deg/360.0)  # target pos is in steps
-    
-    def target_rad(self,rad):
-        self.target(self._steps_per_rev*rad/(2*pi)) # target pos is in steps
-    
-    def get_pos(self) -> int:
-        return (self._pos//2)   # convert half steps to full steps
-    
-    def get_pos_deg(self) -> float:
-        return self._pos*180.0/self._steps_per_rev      # half steps to degrees
-    
-    def get_pos_rad(self) -> float:
-        return self._pos*pi/self._steps_per_rev         # half steps to radians
-    
-    def overwrite_pos(self,p=0):
-        self._pos = 2*int(p)    # convert full steps to half steps
-    
-    def overwrite_pos_deg(self,deg):
-        self._pos = deg*self._steps_per_rev/180.0      # degrees to half steps
-    
-    def overwrite_pos_rad(self,rad):
-        self._pos = rad*self._steps_per_rev/pi         # radians to half steps
-
-    def step(self,d=0):
-        cur_time = time.ticks_ms()
-        if time.ticks_diff(cur_time, self._last_step_time) < self._min_period:
-            # avoid stepping too quickly as this causes skipped steps
-            return
-        self._last_step_time = cur_time
-        if d>0:
-            self._pos+=self._step_size
-            self._phase = (self._phase-self._step_size)%_STEPPER_NUM_PHASES
-        elif d<0:
-            self._pos-=self._step_size
-            self._phase = (self._phase+self._step_size)%_STEPPER_NUM_PHASES
-        # Check position limits
-        if self._calibrated and self._pos < 0:
-            print("s/w min endstop")
-            self._pos = 0
-            self.speed(0)
-            return
-        elif self._calibrated and self._pos > self._max_pos:
-            print("s/w max endstop")
-            self._pos = self._max_pos
-            self.speed(0)
-            return
-        try:
-            self._hexdrive_app.motor_step(self._phase)
-        except Exception as e:                       
-            print(f"step phase {self._phase} failed:{e}")
-
-    def _hit_endstop(self):             
-        print("Endstop - hit")
-        if not self._calibrated:
-            self._calibrated = True
-        # set this as the new zero position
-        self.overwrite_pos(0)
-        # if we were moving towards the endstop, stop
-        if self._free_run_mode < 0:
-            self.speed(0)
-        elif self._free_run_mode == 0 and self._target_pos < self._pos:
-            self.speed(0)
-
-    def _timer_callback_fwd(self,t):
-        self.step(1)
-
-    def _timer_callback_rev(self,t):
-        self.step(-1)
-
-    def _timer_callback(self,t):
-        if self._target_pos>self._pos:
-            self.step(1)
-        elif self._target_pos<self._pos:
-            self.step(-1)
-
-    def free_run(self,d=1):
-        self._free_run_mode=d
-        if d!=0:
-            self._update_timer((2//self._step_size)*abs(self._steps_per_sec))   # half steps per second
-
-    def track_target(self):
-        self._free_run_mode=0
-        self._update_timer((2//self._step_size)*abs(self._steps_per_sec))      # half steps per second
-
-    def _update_timer(self,freq):
-        if self._timer_is_running and freq != self._freq:
-            try:
-                self._timer.deinit()
-                self._freq = 0
-                self._timer_is_running=False
-            except Exception as e:
-                print(f"update_timer failed:{e}")
-        if 0 != freq and (freq != self._freq or self._free_run_mode != self._timer_mode):
-            try:                
-                print(f"Timer: {freq}Hz")
-                if self._free_run_mode>0:
-                    self._timer.init(freq=freq,callback=self._timer_callback_fwd)
-                elif self._free_run_mode<0:
-                    self._timer.init(freq=freq,callback=self._timer_callback_rev)
-                else:
-                    self._timer.init(freq=freq,callback=self._timer_callback)
-                self._freq = freq
-                self._min_period = (1000//freq) - 1
-                self._timer_is_running=True
-                self._timer_mode = self._free_run_mode
-            except Exception as e:
-                print(f"update_timer failed:{e}")
-        elif freq == 0:
-            print("Timer: 0Hz")
-
-
-    def stop(self):
-        self._update_timer(0)
-        try:
-            self._hexdrive_app.motor_release()
-        except Exception as e:
-            print(f"stop failed:{e}")
-
-    def enable(self,e = True):
-        self._enabled=e
-        try:
-            if e:
-                if self._free_run_mode!=0:
-                    self._update_timer((2//self._step_size)*abs(self._steps_per_sec))   # half steps per second                
-                self._hexdrive_app.motor_step(self._phase)
-            else:
-                self._update_timer(0)
-                self._hexdrive_app.motor_release()
-            self._hexdrive_app.set_power(e)
-        except Exception as e:
-            print(f"enable failed:{e}")
-
-    def is_enabled(self) -> bool:
-        return self._enabled
-    
-########## END OF STEPPER CLASS ##########
-
-
 
 class HexDriveType:
     def __init__(self, pid, vid = 0xCAFE, motors = 0, steppers = 0, servos = 0, name ="Unknown"):
