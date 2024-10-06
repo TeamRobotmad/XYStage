@@ -1,6 +1,4 @@
 import asyncio
-import aioble
-import bluetooth
 import os
 import time
 from math import cos, pi
@@ -25,7 +23,7 @@ from tildagonos import tildagonos
 
 import app
 
-from .utils import chain, draw_logo_animated, parse_version
+from .utils import parse_version
 
 _APP_VERSION = "1.0" # XYStage App Version Number
 
