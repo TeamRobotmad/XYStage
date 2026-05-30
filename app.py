@@ -60,11 +60,11 @@ XYSTAGE_HEXPANSION = 1  # Hexpansion slot for XYStage - as it does not have an E
 # Dedicated Pins - to drive an external stepper driver
 X_DIR = 1   # ls pin (LSB)
 X_ENABLE = 0  # ls pin (LSA) - active low
-X_ENDSTOP = 3  # hs pin (HSG) - switch to ground
+X_ENDSTOP = 3  # hs pin (HSI) - switch to ground
 X_STEP = 0  # hs pin (HSF)
 Y_DIR = 3   # ls pin (LSD)
 Y_ENABLE = 2  # ls pin (LSC) - active low
-Y_ENDSTOP = 1  # hs pin (HSI) - switch to ground
+Y_ENDSTOP = 1  # hs pin (HSG) - switch to ground
 Y_STEP = 2  # hs pin (HSH)
 
 _USABLE_X_PIXELS =  200
