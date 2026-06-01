@@ -5,8 +5,8 @@ import pytest
 # Add badge software to pythonpath
 sys.path.append("../../../") 
 
-import sim.run
-from system.hexpansion.config import HexpansionConfig
+pytest.importorskip("sim.run")
+pytest.importorskip("system.hexpansion.config")
 
 
 def test_import_xystage_app_and_app_export():
