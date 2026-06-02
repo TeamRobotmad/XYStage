@@ -260,9 +260,9 @@ def xystage_module(monkeypatch):
 def app_obj(xystage_module):
     obj = xystage_module.XYStageApp.__new__(xystage_module.XYStageApp)
     obj._settings = {
-        "x_usteps_per_mm": types.SimpleNamespace(v=1280),
-        "y_usteps_per_mm": types.SimpleNamespace(v=1280),
-        "gcode_feed": types.SimpleNamespace(v=300),
+        "x_steps_per_mm": types.SimpleNamespace(v=1050),
+        "y_steps_per_mm": types.SimpleNamespace(v=1280),
+        "mm_per_min": types.SimpleNamespace(v=300),
         "logging": types.SimpleNamespace(v=False),
         "min_speed": types.SimpleNamespace(v=320),
         "max_speed": types.SimpleNamespace(v=32000),

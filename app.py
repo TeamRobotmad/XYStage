@@ -33,7 +33,7 @@ _APP_VERSION = "1.0" # XYStage App Version Number
 
 
 # Stepper Tester - Defaults
-_STEPPER_MAX_SPEED          = 1000*32    # steps per second
+_STEPPER_MAX_SPEED          = 500*32     # steps per second
 _STEPPER_MIN_SPEED          = 10*32      # steps per second
 _STEPPER_MAX_ACCELERATION   = 100*32     # steps per second per update
 _STEPPER_MAX_POSITION       = 3100       # steps from h/w endstop to s/w endstop at the other end
@@ -89,7 +89,6 @@ _AUTO_REPEAT_MS = 200       # Time between auto-repeats, in ms
 _AUTO_REPEAT_COUNT_THRES = 10 # Number of auto-repeats before increasing level
 _AUTO_REPEAT_SPEED_LEVEL_MAX = 4  # Maximum level of auto-repeat speed increases
 _AUTO_REPEAT_LEVEL_MAX = 3  # Maximum level of auto-repeat digit increases
-_LONG_PRESS_MS = 750
 
 
 # App states
@@ -132,17 +131,21 @@ JOY_NEG_X = 1  # HSG
 JOY_POS_Y = 2  # HSH
 JOY_NEG_Y = 3  # HSI
 
+_MICRO_STEPS = 32  # We are using DRV8825 configured for 1/32 microstepping
+
 _USABLE_X_PIXELS =  200
 _USABLE_Y_PIXELS =  140
-_WIDTH_DEFAULT   = (2000*32)
-_HEIGHT_DEFAULT  = (2000*32)
-_XRANGE_DEFAULT  = (2200*32) # Driver configured for 1/32 steps
-_YRANGE_DEFAULT  = (2000*32) # Driver configured for 1/32 steps
+_WIDTH_DEFAULT   = (2000*_MICRO_STEPS)  # Driver configured for 1/32 steps
+_HEIGHT_DEFAULT  = (2000*_MICRO_STEPS)  # Driver configured for 1/32 steps
+_XRANGE_DEFAULT  = (2200*_MICRO_STEPS) # Driver configured for 1/32 steps
+_YRANGE_DEFAULT  = (2000*_MICRO_STEPS) # Driver configured for 1/32 steps
 POSITION_MATCH_TOLERANCE = 20
 _GCODE_DIR = "/gcode"
 _GCODE_EXTENSION = ".nc"
+# GCODE replay UI settings
 _GCODE_HISTORY_MAX = 4  # includes currently executing command
 _GCODE_FUTURE_MAX = 2
+
 _GCODE_HOMING_TIMEOUT_MIN_MS = 5000
 _GCODE_HOMING_TIMEOUT_MAX_MS = 120000
 _GCODE_HOMING_TIMEOUT_MARGIN_MS = 4000
@@ -150,10 +153,9 @@ _GCODE_HOMING_BACKOFF_MM = 5.0
 _GCODE_HOMING_FINE_FEED_RATIO = 0.25
 _GCODE_HOMING_FINE_FEED_MIN_MM_MIN = 20
 
-_X_USTEPS_PER_MM_DEFAULT = 1280
-_Y_USTEPS_PER_MM_DEFAULT = 1280
+_X_STEPS_PER_MM_DEFAULT = int(0.5 + (32.8 * _MICRO_STEPS))  # Driver configured for 1/32 steps, 20 steps per rotation, 0.6096 pitch leadscrew => 20/0.6096 = ~32.8 steps per mm
+_Y_STEPS_PER_MM_DEFAULT = int(0.5 + (40.0 * _MICRO_STEPS))  # Driver configured for 1/32 steps, 20 steps per rotation, 0.5 pitch leadscrew => 20/0.5 = 40 steps per mm
 _GCODE_DEFAULT_FEED_MM_MIN = 300
-_GCODE_DEFAULT_ACCEL_MM_S2 = 20
 
 _LED_GREEN = (0, 255, 0)
 _LED_RED = (255, 0, 0)
@@ -180,7 +182,6 @@ class XYStageApp(app.App):
         # UI Button Controls
         self.button_states = Buttons(self)
         self.last_press: Button = BUTTON_TYPES["CANCEL"]
-        self.long_press_delta: int = 0
         self._auto_repeat_intervals = [ _AUTO_REPEAT_MS, _AUTO_REPEAT_MS//2, _AUTO_REPEAT_MS//4, _AUTO_REPEAT_MS//8, _AUTO_REPEAT_MS//16] # at the top end the loop is unlikley to cycle this fast
         self._auto_repeat: int = 0
         self._auto_repeat_count: int = 0
@@ -202,11 +203,10 @@ class XYStageApp(app.App):
         self._settings['YRange']        = MySetting(self._settings, _YRANGE_DEFAULT, 10, 100000)
         self._settings['min_speed']     = MySetting(self._settings, _STEPPER_MIN_SPEED, 10, 10000)
         self._settings['max_speed']     = MySetting(self._settings, _STEPPER_MAX_SPEED, 10, 100000)
-        self._settings['acceleration']  = MySetting(self._settings, _STEPPER_MAX_ACCELERATION, 10, 10000)
-        self._settings['x_usteps_per_mm'] = MySetting(self._settings, _X_USTEPS_PER_MM_DEFAULT, 1, 100000)
-        self._settings['y_usteps_per_mm'] = MySetting(self._settings, _Y_USTEPS_PER_MM_DEFAULT, 1, 100000)
-        self._settings['gcode_feed']    = MySetting(self._settings, _GCODE_DEFAULT_FEED_MM_MIN, 1, 60000)
-        self._settings['gcode_accel']   = MySetting(self._settings, _GCODE_DEFAULT_ACCEL_MM_S2, 1, 10000)
+        self._settings['acceleration']  = MySetting(self._settings, _STEPPER_MAX_ACCELERATION,  1, 1000)
+        self._settings['x_steps_per_mm'] = MySetting(self._settings, _X_STEPS_PER_MM_DEFAULT, 1, 100000)
+        self._settings['y_steps_per_mm'] = MySetting(self._settings, _Y_STEPS_PER_MM_DEFAULT, 1, 100000)
+        self._settings['mm_per_min']    = MySetting(self._settings, _GCODE_DEFAULT_FEED_MM_MIN, 1, 60000)
 
         self._edit_setting: int  = None
         self._edit_setting_value = None
@@ -227,15 +227,16 @@ class XYStageApp(app.App):
         self._xystage_port: int | None  = _XYSTAGE_HEXPANSION_SLOT
         self._joystick_port: int | None = _JOYSTICK_HEXPANSION_SLOT
 
-        self._xystage_config: HexpansionConfig  = HexpansionConfig(self._xystage_port) if self._xystage_port else None
-        self._joystick_config: HexpansionConfig = HexpansionConfig(self._joystick_port) if self._joystick_port else None
+        self._xystage_config: HexpansionConfig | None = None
+        self._joystick_config: HexpansionConfig | None = None
+
         self._joystick_pins = {}
         eventbus.on_async(HexpansionInsertionEvent, self._handle_hexpansion_insertion, self)
         eventbus.on_async(HexpansionRemovalEvent, self._handle_hexpansion_removal, self)
 
         # Motor Driver
-        self._stepperX: Stepper = None
-        self._stepperY: Stepper = None
+        self._stepperX: Stepper | None = None
+        self._stepperY: Stepper | None = None
         self.xystage = {}
         self.xystage['x'] = 0
         self.xystage['y'] = 0
@@ -256,7 +257,7 @@ class XYStageApp(app.App):
         self._gcode_abort_requested = False
         self._gcode_move_active = False
         self._gcode_move_target = {'x': 0, 'y': 0}
-        self._gcode_move_feed_mm_min = self._settings['gcode_feed'].v
+        self._gcode_move_feed_mm_min = self._settings['mm_per_min'].v
         self._gcode_speed_limit = self._default_gcode_speed_limits_mm_min()
         self._gcode_selected_file = None
         self._gcode_error = None
@@ -267,7 +268,6 @@ class XYStageApp(app.App):
         self._record_waypoints_mm = []
         self._record_capture_debounce = False
         self._filename_dialog: TextDialog = None
-        self.long_press_delta = 0
 
         # LED runtime state
         self._led_mode = LED_MODE_IDLE
@@ -292,15 +292,16 @@ class XYStageApp(app.App):
     async def _handle_hexpansion_removal(self, event: HexpansionRemovalEvent):
         if event.port == self._xystage_port:
             self._xystage_port = None
+            self._xystage_config = None
             self.current_state = STATE_WARNING
-            self.notification = Notification("XY Stage   Removed")
+            self.notification = Notification("XY Stage Removed")
             if self._settings['logging'].v:
                 print("XY Stage:Removed")            
         if event.port == self._joystick_port:
             self._joystick_port = None
             self._joystick_config = None
             self._joystick_pins = {}
-            self.notification = Notification("Joystick   Removed")
+            self.notification = Notification("Joystick Removed")
             if self._settings['logging'].v:
                 print("Joystick:Removed")
 
@@ -330,6 +331,9 @@ class XYStageApp(app.App):
                 if self._settings['logging'].v:
                     print(f"XYStage:Found on port {port}")
                 self._xystage_port = port
+
+        if self._xystage_port is not None:
+            self._ensure_steppers_ready()
 
 
     def update_settings(self):
@@ -399,7 +403,7 @@ class XYStageApp(app.App):
         if not self._ensure_steppers_ready(silent=True):
             self.current_state = STATE_MENU
             self.set_menu("main")
-            self.notification = Notification(" No Free  Timers")
+            self.notification = Notification("No Free Timers")
             self._set_led_mode(LED_MODE_ERROR)
             return
 
@@ -458,7 +462,7 @@ class XYStageApp(app.App):
                     self._stepperY.enable(False)                
                     self.current_state = STATE_MENU
                     self.set_menu("main")
-                    self.notification = Notification("  Stepper:\n Timeout")
+                    self.notification = Notification("Stepper Timeout")
                     if self._settings['logging'].v:
                         print("Stepper:Timeout")          
 
@@ -569,47 +573,47 @@ class XYStageApp(app.App):
                     print(f"Setting: {self._edit_setting} = {self._edit_setting_value}")
                 self._settings[self._edit_setting].v = self._edit_setting_value
                 self._settings[self._edit_setting].persist()
-                self.notification = Notification(f"  Setting:   {self._edit_setting}={self._edit_setting_value}")
+                self.notification = Notification(f"Setting: {self._edit_setting}={self._edit_setting_value}")
                 self.set_menu("Settings")
                 self.current_state = STATE_MENU
 
 
     def _mm_to_steps(self, axis: str, mm: float) -> int:
-        scale = self._settings['x_usteps_per_mm'].v if axis == 'x' else self._settings['y_usteps_per_mm'].v
+        scale = self._settings['x_steps_per_mm'].v if axis == 'x' else self._settings['y_steps_per_mm'].v
         return int(round(mm * scale))
 
 
     def _steps_to_mm(self, axis: str, steps: int) -> float:
-        scale = self._settings['x_usteps_per_mm'].v if axis == 'x' else self._settings['y_usteps_per_mm'].v
+        scale = self._settings['x_steps_per_mm'].v if axis == 'x' else self._settings['y_steps_per_mm'].v
         if scale <= 0:
             return 0.0
         return float(steps) / float(scale)
 
 
     def _mm_min_to_sps_x(self, mm_min: float) -> int:
-        return max(0, int((mm_min * self._settings['x_usteps_per_mm'].v) / 60.0))
+        return max(0, int((mm_min * self._settings['x_steps_per_mm'].v) / 60.0))
 
 
     def _mm_min_to_sps_y(self, mm_min: float) -> int:
-        return max(0, int((mm_min * self._settings['y_usteps_per_mm'].v) / 60.0))
+        return max(0, int((mm_min * self._settings['y_steps_per_mm'].v) / 60.0))
 
 
     def _sps_to_mm_min_x(self, sps: int) -> float:
-        scale = self._settings['x_usteps_per_mm'].v
+        scale = self._settings['x_steps_per_mm'].v
         if scale <= 0:
             return 0.0
         return (float(sps) * 60.0) / float(scale)
 
 
     def _sps_to_mm_min_y(self, sps: int) -> float:
-        scale = self._settings['y_usteps_per_mm'].v
+        scale = self._settings['y_steps_per_mm'].v
         if scale <= 0:
             return 0.0
         return (float(sps) * 60.0) / float(scale)
 
 
     def _default_gcode_speed_limits_mm_min(self):
-        feed = max(1.0, float(self._settings['gcode_feed'].v))
+        feed = max(1.0, float(self._settings['mm_per_min'].v))
         return {
             'x': feed,
             'y': feed,
@@ -890,21 +894,24 @@ class XYStageApp(app.App):
 
 
     def _get_default_homing_preamble_lines(self):
-        fast_feed = max(1.0, float(self._settings['gcode_feed'].v))
+        fast_feed = max(1.0, float(self._settings['mm_per_min'].v))
         fine_feed = max(_GCODE_HOMING_FINE_FEED_MIN_MM_MIN, fast_feed * _GCODE_HOMING_FINE_FEED_RATIO)
-        fine_feed = min(fast_feed, fine_feed)
         backoff_mm = max(0.1, float(_GCODE_HOMING_BACKOFF_MM))
+        # convert from stage coordinates (0,0 in centre) in usteps to GCODE coordinates (0,0 at min endstop) in mm
+        centre_x_mm = self._steps_to_mm('x', self._settings['XRange'].v // 2)
+        centre_y_mm = self._steps_to_mm('y', self._settings['YRange'].v // 2)
 
         return [
-            f"M203 X{fast_feed:.3f} Y{fast_feed:.3f}",
+            f"M203 X{fast_feed:.2f} Y{fast_feed:.2f}",
             "G28",
             "G91",
-            f"G1 X{backoff_mm:.3f} Y{backoff_mm:.3f} F{fast_feed:.3f}",
+            f"G1 X{backoff_mm:.2f} Y{backoff_mm:.2f} F{fast_feed:.2f}",
             "G90",
-            f"M203 X{fine_feed:.3f} Y{fine_feed:.3f}",
+            f"M203 X{fine_feed:.2f} Y{fine_feed:.2f}",
             "G28",
-            f"M203 X{fast_feed:.3f} Y{fast_feed:.3f}",
+            f"M203 X{fast_feed:.2f} Y{fast_feed:.2f}",
             "G90",
+            f"G1 X{centre_x_mm:.2f} Y{centre_y_mm:.2f} F{fast_feed:.2f}",
         ]
 
 
@@ -919,7 +926,7 @@ class XYStageApp(app.App):
             return
 
         self._start_gcode_replay(commands, "HOME")
-        self.notification = Notification("  Home XY")
+        self.notification = Notification("Home XY")
 
 
     def _clear_gcode_runtime(self):
@@ -946,7 +953,7 @@ class XYStageApp(app.App):
         self._gcode_commands = commands
         self._gcode_selected_file = filename
         self._gcode_mode_absolute = True
-        self._gcode_move_feed_mm_min = self._settings['gcode_feed'].v
+        self._gcode_move_feed_mm_min = self._settings['mm_per_min'].v
         self._gcode_speed_limit = self._default_gcode_speed_limits_mm_min()
         self.current_state = STATE_GCODE_REPLAY
         self.set_menu(None)
@@ -1264,40 +1271,39 @@ class XYStageApp(app.App):
             self._stepperX.enable(True)
             self._stepperY.enable(True)
             self._complete_current_gcode_step()
-        elif c == 'M18':
+        elif c == 'M18':        # Disable steppers
             self._stepperX.stop()
             self._stepperY.stop()
             self._stepperX.enable(False)
             self._stepperY.enable(False)
             self._complete_current_gcode_step()
-        elif c == 'M112':
+        elif c == 'M112':       # Emergency stop
             self._stepperX.stop()
             self._stepperY.stop()
             self._stepperX.enable(False)
             self._stepperY.enable(False)
             self._set_error_state(["Emergency stop", "M112", "Re-home req"], "M112 emergency stop")
-        elif c == 'M114':
+        elif c == 'M114':       # Report position
             x_mm = self._steps_to_mm('x', self._stepperX.get_pos(0))
             y_mm = self._steps_to_mm('y', self._stepperY.get_pos(0))
-            self._log_gcode(f"M114 X{x_mm:.3f} Y{y_mm:.3f}")
+            self._log_gcode(f"M114 X{x_mm:.2f} Y{y_mm:.2f}")
             self._complete_current_gcode_step()
-        elif c == 'M203':
+        elif c == 'M203':       # Speed limits
             if 'X' in p:
                 self._gcode_speed_limit['x'] = max(1.0, p['X'])
             if 'Y' in p:
                 self._gcode_speed_limit['y'] = max(1.0, p['Y'])
             self._complete_current_gcode_step()
-        elif c == 'M204':
+        elif c == 'M204':       # Acceleration
             accel_mm_s2 = max(1.0, p['S'])
-            self._settings['gcode_accel'].v = int(accel_mm_s2)
             updates_x = max(1, int(getattr(self._stepperX, "_updates_per_sec", 1)))
             updates_y = max(1, int(getattr(self._stepperY, "_updates_per_sec", 1)))
-            x_change = int((accel_mm_s2 * self._settings['x_usteps_per_mm'].v) / updates_x)
-            y_change = int((accel_mm_s2 * self._settings['y_usteps_per_mm'].v) / updates_y)
+            x_change = int((accel_mm_s2 * self._settings['x_steps_per_mm'].v) / updates_x)
+            y_change = int((accel_mm_s2 * self._settings['y_steps_per_mm'].v) / updates_y)
             self._stepperX.set_max_sps_change(max(1, x_change))
             self._stepperY.set_max_sps_change(max(1, y_change))
             self._complete_current_gcode_step()
-        elif c == 'M400':
+        elif c == 'M400':       # Wait for moves to finish
             self._complete_current_gcode_step()
         else:
             self._set_error_state(["Unsupported", c, f"Line {cmd['line']}"], f"unsupported L{cmd['line']} {c}")
@@ -1312,7 +1318,7 @@ class XYStageApp(app.App):
         self._clear_gcode_runtime()
         self.current_state = STATE_MENU
         self.set_menu("main")
-        self.notification = Notification(" Replay    aborted")
+        self.notification = Notification("Replay aborted")
         self._set_led_mode(LED_MODE_IDLE)
 
 
@@ -1360,7 +1366,7 @@ class XYStageApp(app.App):
 
         if self._gcode_current_index >= len(self._gcode_commands):
             self._log_gcode("replay complete")
-            self.notification = Notification(" Replay   done")
+            self.notification = Notification("Replay done")
             self.current_state = STATE_MENU
             self.set_menu("main")
             self._stepperX.enable(False)
@@ -1388,7 +1394,7 @@ class XYStageApp(app.App):
         x_mm = self._steps_to_mm('x', self._stepperX.get_pos(0))
         y_mm = self._steps_to_mm('y', self._stepperY.get_pos(0))
         self._record_waypoints_mm.append((x_mm, y_mm))
-        self._log_gcode(f"record capture idx={len(self._record_waypoints_mm)} X{x_mm:.3f} Y{y_mm:.3f}")
+        self._log_gcode(f"record capture idx={len(self._record_waypoints_mm)} X{x_mm:.2f} Y{y_mm:.2f}")
         self.notification = Notification(f"Pt {len(self._record_waypoints_mm)}")
         self._refresh = True
 
@@ -1451,9 +1457,9 @@ class XYStageApp(app.App):
                 for line in self._get_default_homing_preamble_lines():
                     handle.write(line + "\n")
                 for x_mm, y_mm in self._record_waypoints_mm:
-                    handle.write(f"G1 X{x_mm:.3f} Y{y_mm:.3f} F{self._settings['gcode_feed'].v}\n")
+                    handle.write(f"G1 X{x_mm:.2f} Y{y_mm:.2f} F{self._settings['mm_per_min'].v}\n")
                     handle.write("M0\n")
-            self.notification = Notification("  Saved    .nc")
+            self.notification = Notification(f"Saved {trimmed}")
             self._log_gcode(f"record saved {full_path}")
         except Exception as e:
             self._set_error_state(["Save failed", str(e)[:18]], f"save failed {e}")
@@ -1475,45 +1481,34 @@ class XYStageApp(app.App):
             self._set_led_mode(LED_MODE_INPUT)
             return
 
-        if self.button_states.get(BUTTON_TYPES["CONFIRM"]) and self.button_states.get(BUTTON_TYPES["CANCEL"]):
-            self.button_states.clear()
-            self._start_default_homing_sequence()
-            return
-
         self._update_live_position(delta)
         pressed = self._apply_manual_movement(delta)
 
         if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
-            # Short press confirm to capture a point, long press to save the recording.
-            self.long_press_delta += delta
-            if self.long_press_delta >= _LONG_PRESS_MS:
-                self.button_states.clear()
-                self.long_press_delta = 0
-                if len(self._record_waypoints_mm) == 0:
-                    self.notification = Notification("No points")
-                    self._set_led_mode(LED_MODE_INPUT)
-                else:
-                    self._open_filename_dialog()
-            elif not self._record_capture_debounce:
+            self.button_states.clear()
+            if not self._record_capture_debounce:
                 self._record_capture_debounce = True
-                self._capture_record_waypoint()         
+                self.notification = Notification("Point captured")
+                self._capture_record_waypoint()
             return
         else:
-            self.long_press_delta = 0
             self._record_capture_debounce = False
 
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
-            self._record_waypoints_mm = []
-            self._close_filename_dialog()
-            self._stepperX.stop()
-            self._stepperY.stop()
-            self._stepperX.enable(False)
-            self._stepperY.enable(False)
-            self.current_state = STATE_MENU
-            self.set_menu("main")
-            self.notification = Notification(" Record   discard")
-            self._set_led_mode(LED_MODE_IDLE)
+            if len(self._record_waypoints_mm) == 0:
+                self.notification = Notification("No points")
+                #self._record_waypoints_mm = []
+                self._close_filename_dialog()
+                self._stepperX.stop()
+                self._stepperY.stop()
+                self._stepperX.enable(False)
+                self._stepperY.enable(False)
+                self.current_state = STATE_MENU
+                self.set_menu("main")
+                self._set_led_mode(LED_MODE_IDLE)
+            else:
+                self._open_filename_dialog()
             return
 
         if pressed:
@@ -1524,6 +1519,13 @@ class XYStageApp(app.App):
 
 
     def _ensure_steppers_ready(self, silent: bool = False) -> bool:
+        if self._xystage_port is None:
+            if not silent:
+                self.notification = Notification("No XYStage")
+                self._set_led_mode(LED_MODE_ERROR)
+            return False
+        self._xystage_config: HexpansionConfig  = HexpansionConfig(self._xystage_port)
+
         if self._stepperX is None or self._stepperY is None:
             for i in range(4):
                 if self._stepperX is None:
@@ -1574,7 +1576,7 @@ class XYStageApp(app.App):
 
         if self._stepperX is None or self._stepperY is None:
             if not silent:
-                self.notification = Notification("No Free   Timers")
+                self.notification = Notification("No Free Timers")
                 self._set_led_mode(LED_MODE_ERROR)
             return False
 
@@ -1744,7 +1746,6 @@ class XYStageApp(app.App):
         ctx.rgb(*colour).move_to(x, y).text(title)
 
     def _draw_state_xystage(self, ctx):
-        self._draw_centered_title(ctx, "XY Stage")
         # Draw outer rectangle for the XYStage based on the largest that can fit on the screen
         # top left of the rectangle is at -100,-100 i.e. Y is inverted
         ctx.rgb(0.3,0.3,0.3).rectangle(-_USABLE_X_PIXELS//2,-_USABLE_Y_PIXELS//2,_USABLE_X_PIXELS,_USABLE_Y_PIXELS).stroke()
@@ -1755,7 +1756,9 @@ class XYStageApp(app.App):
         ctx.rgb(0,0,0).move_to(x-10,y).line_to(x+10,y).stroke()
         ctx.rgb(0,0,0).move_to(x,y-10).line_to(x,y+10).stroke()
         # Display the x,y position of the stage in text underneath the stage
-        ctx.rgb(1,1,1).move_to(-70, 100).text(f"{self.xystage['x']//32:5d}, {self.xystage['y']//32:5d}")
+        if self.current_state == STATE_XYSTAGE:
+            self._draw_centered_title(ctx, "XY Stage")
+            ctx.rgb(1,1,1).move_to(-70, 100).text(f"{self.xystage['x']//32:5d}, {self.xystage['y']//32:5d}")
         #button_labels(ctx, confirm_label="Stop", cancel_label="Exit", left_label="<--", right_label="-->")
 
 
@@ -1805,7 +1808,7 @@ class XYStageApp(app.App):
     def _draw_state_gcode_record(self, ctx):
         self._draw_state_xystage(ctx)
         self._draw_centered_title(ctx, f"Record:{len(self._record_waypoints_mm)}", colour=(0, 1, 0))
-        button_labels(ctx, down_label="Mark", confirm_label="Save", cancel_label="Drop")
+        button_labels(ctx, confirm_label="Mark", cancel_label="Done")
 
     def _scale_xystage(self, x: int, y: int) -> (int, int):
         # scale x,y to the canvas range:
@@ -1957,7 +1960,7 @@ class XYStageApp(app.App):
             if self._settings['logging'].v:
                 print("H:Settings Save All")
             settings.save()
-            self.notification = Notification("  Settings  Saved")
+            self.notification = Notification("Settings Saved")
             self.set_menu("main")
             self.button_states.clear()
         elif idx == 1: #Default
@@ -1966,7 +1969,7 @@ class XYStageApp(app.App):
             for s in self._settings:
                 self._settings[s].v = self._settings[s].d
                 self._settings[s].persist()
-            self.notification = Notification("  Settings Defaulted")
+            self.notification = Notification("Settings Defaulted")
 
             self.set_menu("main")
             self.button_states.clear()
@@ -2211,10 +2214,7 @@ class Stepper:  # External Driver DRV8825
             sibling = self._get_sibling_stepper()
             if sibling is not None and sibling._pwm is not None and sibling._pwm_hw_timer is not None:
                 if int(getattr(sibling, "_freq", 0)) == requested_freq:
-                    if requested_freq < 40_000_000:
-                        create_freq = requested_freq + 1
-                    elif requested_freq > 1:
-                        create_freq = requested_freq - 1
+                    create_freq = requested_freq + 1
                     if self._container._settings['logging'].v:
                         print(f"{self._name} PWM init offset:{requested_freq}->{create_freq}Hz to avoid shared timer")
 
