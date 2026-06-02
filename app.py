@@ -108,12 +108,12 @@ STATE_GCODE_RECORD = 8   # Manual movement + waypoint capture
 _MINIMISE_VALID_STATES = [STATE_WARNING, STATE_MENU, STATE_MESSAGE]
 
 # Hexpansion constants
-_XYSTAGE_HEXPANSION_SLOT = 2  # Hexpansion slot for XYStage - as it does not have an EEPROM to be detected automatically
+_XYSTAGE_HEXPANSION_SLOT = None  # Hexpansion slot for XYStage - if it does not have an EEPROM to be detected automatically
 _XYSTAGE_VID = 0xCBCB
-_XYSTAGE_PID = 0x5000
-_JOYSTICK_HEXPANSION_SLOT = 4 # Hexpansion slot for Joystick - as it does not have an EEPROM to be detected automatically
+_XYSTAGE_PID = 0x6000
+_JOYSTICK_HEXPANSION_SLOT = None # Hexpansion slot for Joystick - if it does not have an EEPROM to be detected automatically
 _JOYSTICK_VID = 0xCBCB
-_JOYSTICK_PID = 0x5001
+_JOYSTICK_PID = 0x6001
 
 
 # Dedicated Pins - to drive an external stepper driver
@@ -146,6 +146,9 @@ _GCODE_FUTURE_MAX = 2
 _GCODE_HOMING_TIMEOUT_MIN_MS = 5000
 _GCODE_HOMING_TIMEOUT_MAX_MS = 120000
 _GCODE_HOMING_TIMEOUT_MARGIN_MS = 4000
+_GCODE_HOMING_BACKOFF_MM = 5.0
+_GCODE_HOMING_FINE_FEED_RATIO = 0.25
+_GCODE_HOMING_FINE_FEED_MIN_MM_MIN = 20
 
 _X_USTEPS_PER_MM_DEFAULT = 1280
 _Y_USTEPS_PER_MM_DEFAULT = 1280
@@ -169,7 +172,7 @@ LED_MODE_MOVING = "moving"
 _LOGGING = True
 
 # Menu Items
-_main_menu_items = ["XYStage", "Run NC", "Record NC", "Settings", "About", "Exit"]
+_main_menu_items = ["XYStage", "Home XY", "Run NC", "Record NC", "Settings", "About", "Exit"]
 
 class XYStageApp(app.App):
     def __init__(self):
@@ -221,8 +224,8 @@ class XYStageApp(app.App):
             pass
 
         # Hexpansion related
-        self._xystage_port: int = _XYSTAGE_HEXPANSION_SLOT
-        self._joystick_port: int = _JOYSTICK_HEXPANSION_SLOT
+        self._xystage_port: int | None  = _XYSTAGE_HEXPANSION_SLOT
+        self._joystick_port: int | None = _JOYSTICK_HEXPANSION_SLOT
 
         self._xystage_config: HexpansionConfig  = HexpansionConfig(self._xystage_port) if self._xystage_port else None
         self._joystick_config: HexpansionConfig = HexpansionConfig(self._joystick_port) if self._joystick_port else None
@@ -347,7 +350,6 @@ class XYStageApp(app.App):
                 self.current_state = STATE_WARNING
             else:
                 self.current_state = STATE_MENU
-            self.current_state = STATE_MENU # NO HEXDRIVE REQUIRED FOR XYSTAGE AT PRESENT
         
         self._update_main_application(delta)
         self._update_leds(delta)
@@ -397,7 +399,7 @@ class XYStageApp(app.App):
         if not self._ensure_steppers_ready(silent=True):
             self.current_state = STATE_MENU
             self.set_menu("main")
-            self.notification = Notification("No Free  Timers")
+            self.notification = Notification(" No Free  Timers")
             self._set_led_mode(LED_MODE_ERROR)
             return
 
@@ -876,6 +878,48 @@ class XYStageApp(app.App):
                     parsed.append(entry)
                     self._log_gcode(f"parse L{line_num} {entry['cmd']}")
         return parsed
+
+
+    def _build_gcode_commands_from_lines(self, lines):
+        parsed = []
+        for line_num, line in enumerate(lines, 1):
+            entry = self._parse_gcode_line(line, line_num)
+            if entry is not None:
+                parsed.append(entry)
+        return parsed
+
+
+    def _get_default_homing_preamble_lines(self):
+        fast_feed = max(1.0, float(self._settings['gcode_feed'].v))
+        fine_feed = max(_GCODE_HOMING_FINE_FEED_MIN_MM_MIN, fast_feed * _GCODE_HOMING_FINE_FEED_RATIO)
+        fine_feed = min(fast_feed, fine_feed)
+        backoff_mm = max(0.1, float(_GCODE_HOMING_BACKOFF_MM))
+
+        return [
+            f"M203 X{fast_feed:.3f} Y{fast_feed:.3f}",
+            "G28",
+            "G91",
+            f"G1 X{backoff_mm:.3f} Y{backoff_mm:.3f} F{fast_feed:.3f}",
+            "G90",
+            f"M203 X{fine_feed:.3f} Y{fine_feed:.3f}",
+            "G28",
+            f"M203 X{fast_feed:.3f} Y{fast_feed:.3f}",
+            "G90",
+        ]
+
+
+    def _start_default_homing_sequence(self):
+        if not self._ensure_steppers_ready(silent=False):
+            return
+
+        try:
+            commands = self._build_gcode_commands_from_lines(self._get_default_homing_preamble_lines())
+        except Exception as e:
+            self._set_error_state(["Home script", "invalid", str(e)[:18]], f"Home script parse failed {e}")
+            return
+
+        self._start_gcode_replay(commands, "HOME")
+        self.notification = Notification("  Home XY")
 
 
     def _clear_gcode_runtime(self):
@@ -1404,8 +1448,8 @@ class XYStageApp(app.App):
         try:
             with open(full_path, "w") as handle:
                 handle.write(f"; XYStage {_APP_VERSION}\n")
-                handle.write("G28 O\n") # Home all axes if needed before replay to ensure consistent starting point.
-                handle.write("G90\n")   # Use absolute coordinates for replay simplicity.
+                for line in self._get_default_homing_preamble_lines():
+                    handle.write(line + "\n")
                 for x_mm, y_mm in self._record_waypoints_mm:
                     handle.write(f"G1 X{x_mm:.3f} Y{y_mm:.3f} F{self._settings['gcode_feed'].v}\n")
                     handle.write("M0\n")
@@ -1429,6 +1473,11 @@ class XYStageApp(app.App):
 
         if self._filename_dialog is not None:
             self._set_led_mode(LED_MODE_INPUT)
+            return
+
+        if self.button_states.get(BUTTON_TYPES["CONFIRM"]) and self.button_states.get(BUTTON_TYPES["CANCEL"]):
+            self.button_states.clear()
+            self._start_default_homing_sequence()
             return
 
         self._update_live_position(delta)
@@ -1865,9 +1914,11 @@ class XYStageApp(app.App):
                 self._stepperY.enable(True)
                 self._time_since_last_input = 0
                 self._set_led_mode(LED_MODE_IDLE)
-        elif item == _main_menu_items[1]: # Run NC
+        elif item == _main_menu_items[1]: # Home XY
+            self._start_default_homing_sequence()
+        elif item == _main_menu_items[2]: # Run NC
             self._enter_gcode_file_browser()
-        elif item == _main_menu_items[2]: # Record NC
+        elif item == _main_menu_items[3]: # Record NC
             if self._ensure_steppers_ready(silent=False):
                 self.set_menu(None)
                 self.button_states.clear()
@@ -1880,20 +1931,20 @@ class XYStageApp(app.App):
                 self._stepperX.enable(True)
                 self._stepperY.enable(True)
                 self._time_since_last_input = 0
-        elif item == _main_menu_items[3]: # Settings
+        elif item == _main_menu_items[4]: # Settings
             self.notification = None
             self.button_states.clear()
             self.set_menu("Settings")
             self.current_state = STATE_MENU
             self._refresh = True
-        elif item == _main_menu_items[4]: # About
+        elif item == _main_menu_items[5]: # About
             self.set_menu(None)
             self.button_states.clear()
             self.notification = None
             self.error_message = ["XYStage",f"Version: {_APP_VERSION}"]
             self.current_state = STATE_MESSAGE
             self._refresh = True   
-        elif item == _main_menu_items[5]: # Exit
+        elif item == _main_menu_items[6]: # Exit
             self._release_led_control()
             eventbus.remove(HexpansionInsertionEvent, self._handle_hexpansion_insertion, self)
             eventbus.remove(HexpansionRemovalEvent, self._handle_hexpansion_removal, self)
