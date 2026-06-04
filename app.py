@@ -13,7 +13,7 @@ from events.input import BUTTON_TYPES, Button, Buttons
 from frontboards.twentyfour import BUTTONS
 from machine import PWM, Pin
 from system.eventbus import eventbus
-from system.hexpansion.events import (HexpansionInsertionEvent,
+from system.hexpansion.events import (HexpansionMountedEvent,
                                       HexpansionRemovalEvent)
 from system.hexpansion.config import HexpansionConfig
 from system.hexpansion.util   import get_slots_by_vid_pid
@@ -231,7 +231,7 @@ class XYStageApp(app.App):
         self._joystick_config: HexpansionConfig | None = None
 
         self._joystick_pins = {}
-        eventbus.on_async(HexpansionInsertionEvent, self._handle_hexpansion_insertion, self)
+        eventbus.on_async(HexpansionMountedEvent, self._handle_hexpansion_mounted, self)
         eventbus.on_async(HexpansionRemovalEvent, self._handle_hexpansion_removal, self)
 
         # Motor Driver
@@ -305,18 +305,21 @@ class XYStageApp(app.App):
             if self._settings['logging'].v:
                 print("Joystick:Removed")
 
-    async def _handle_hexpansion_insertion(self, event: HexpansionInsertionEvent):
+    async def _handle_hexpansion_mounted(self, event: HexpansionMountedEvent):
+        print(f"XY:Hexpansion mounted in port {event.port}")
         self.check_port_for_hexpansions(event.port)
+
 
 
     ### HEXPANSION FUNCTIONS ###
 
     def check_port_for_hexpansions(self, port: int):
         # we currently ignore the requested port and use the new get_slots_by_vid_pid function to check for the presence of the hexpansions we are interested in
+        # so this works on initialisation as well as in response to insertion events
         if self._joystick_port is None:
             slots = get_slots_by_vid_pid(_JOYSTICK_VID, _JOYSTICK_PID)
             if slots:
-                port = slots[0]
+                port = slots[0] # only use the first one we find, even if multiple are present
                 if self._settings['logging'].v:
                     print(f"Joy:Found on port {port}")
                 self._joystick_port = port
@@ -327,7 +330,7 @@ class XYStageApp(app.App):
         if self._xystage_port is None:
             slots = get_slots_by_vid_pid(_XYSTAGE_VID, _XYSTAGE_PID)
             if slots:
-                port = slots[0]
+                port = slots[0] # only use the first one we find, even if multiple are present
                 if self._settings['logging'].v:
                     print(f"XYStage:Found on port {port}")
                 self._xystage_port = port
@@ -360,7 +363,7 @@ class XYStageApp(app.App):
 
         if self.current_state != self.previous_state:
             if self._settings['logging'].v:
-                print(f"State: {self.previous_state} -> {self.current_state}")
+                print(f"XYState: {self.previous_state} -> {self.current_state}")
             self.previous_state = self.current_state
             # something has changed - so worth redrawing
             self._refresh = True
@@ -375,7 +378,7 @@ class XYStageApp(app.App):
                 self.menu.update(delta)    
                 if self.menu.is_animating != "none":
                     if self._settings['logging'].v:
-                        print("Menu is animating")
+                        print("XY Menu is animating")
                     self._refresh = True
                 if self.current_state == STATE_GCODE_FILES:
                     self._set_led_mode(LED_MODE_INPUT)
@@ -540,13 +543,13 @@ class XYStageApp(app.App):
             if self._auto_repeat_check(delta, False):
                 self._edit_setting_value = self._settings[self._edit_setting].inc(self._edit_setting_value, self._auto_repeat_level)
                 if self._settings['logging'].v:
-                    print(f"Setting: {self._edit_setting} (+) Value: {self._edit_setting_value}")
+                    print(f"XY Setting: {self._edit_setting} (+) Value: {self._edit_setting_value}")
                 self._refresh = True
         elif self.button_states.get(BUTTON_TYPES["DOWN"]):
             if self._auto_repeat_check(delta, False):
                 self._edit_setting_value = self._settings[self._edit_setting].dec(self._edit_setting_value, self._auto_repeat_level)  
                 if self._settings['logging'].v:
-                    print(f"Setting: {self._edit_setting} (-) Value: {self._edit_setting_value}")
+                    print(f"XY Setting: {self._edit_setting} (-) Value: {self._edit_setting_value}")
                 self._refresh = True            
         else:
             # non auto-repeating buttons
@@ -556,21 +559,21 @@ class XYStageApp(app.App):
                 # Force default value    
                 self._edit_setting_value = self._settings[self._edit_setting].d
                 if self._settings['logging'].v:
-                    print(f"Setting: {self._edit_setting} Default: {self._edit_setting_value}")
+                    print(f"XY Setting: {self._edit_setting} Default: {self._edit_setting_value}")
                 self._refresh = True
                 self.notification = Notification("Default")
             elif self.button_states.get(BUTTON_TYPES["CANCEL"]):
                 self.button_states.clear()
                 # leave setting unchanged
                 if self._settings['logging'].v:
-                    print(f"Setting: {self._edit_setting} Cancelled")
+                    print(f"XY Setting: {self._edit_setting} Cancelled")
                 self.set_menu("Settings")
                 self.current_state = STATE_MENU
             elif self.button_states.get(BUTTON_TYPES["CONFIRM"]):
                 self.button_states.clear()
                 # set setting
                 if self._settings['logging'].v:
-                    print(f"Setting: {self._edit_setting} = {self._edit_setting_value}")
+                    print(f"XY Setting: {self._edit_setting} = {self._edit_setting_value}")
                 self._settings[self._edit_setting].v = self._edit_setting_value
                 self._settings[self._edit_setting].persist()
                 self.notification = Notification(f"Setting: {self._edit_setting}={self._edit_setting_value}")
@@ -1628,7 +1631,7 @@ class XYStageApp(app.App):
                 self._led_control_taken = True
         except Exception as e:
             if self._settings['logging'].v:
-                print(f"LED:take failed {e}")
+                print(f"XY:LED take failed {e}")
 
 
     def _release_led_control(self):
@@ -1641,7 +1644,7 @@ class XYStageApp(app.App):
                 self._led_control_taken = False
         except Exception as e:
             if self._settings['logging'].v:
-                print(f"LED:release failed {e}")
+                print(f"XY:LED release failed {e}")
 
 
     def _set_led_mode(self, mode: str):
@@ -1681,7 +1684,7 @@ class XYStageApp(app.App):
             self._led_last_mode = mode
         except Exception as e:
             if self._settings['logging'].v:
-                print(f"LED:update failed {e}")
+                print(f"XY:LED update failed {e}")
 
 
     def _minimise_with_cleanup(self):
@@ -1858,7 +1861,7 @@ class XYStageApp(app.App):
 
     def set_menu(self, menu_name = "main"):  #: Literal["main"]): does it work without the type hint?
         if self._settings['logging'].v:
-            print(f"H:Set Menu {menu_name}")
+            print(f"XY:Set Menu {menu_name}")
         if self.menu is not None:
             try:
                 self.menu._cleanup()
@@ -1905,7 +1908,7 @@ class XYStageApp(app.App):
     # this appears to be able to be called at any time
     def _main_menu_select_handler(self, item: str, idx: int):
         if self._settings['logging'].v:
-            print(f"H:Main Menu {item} at index {idx}")
+            print(f"XY:Main Menu {item} at index {idx}")
         if item == _main_menu_items[0]: # XYStage
             if self._ensure_steppers_ready(silent=False):
                 self.set_menu(None)
@@ -1946,7 +1949,7 @@ class XYStageApp(app.App):
             self.notification = None
             self.error_message = ["XYStage",f"Version: {_APP_VERSION}"]
             self.current_state = STATE_MESSAGE
-            self._refresh = True   
+            self._refresh = True  
         elif item == _main_menu_items[6]: # Exit
             self._release_led_control()
             eventbus.remove(HexpansionInsertionEvent, self._handle_hexpansion_insertion, self)
@@ -1955,17 +1958,17 @@ class XYStageApp(app.App):
 
     def _settings_menu_select_handler(self, item: str, idx: int):
         if self._settings['logging'].v:
-            print(f"H:Setting {item} @ {idx}")
+            print(f"XY:Setting {item} @ {idx}")
         if idx == 0: #Save
             if self._settings['logging'].v:
-                print("H:Settings Save All")
+                print("XY:Settings Save All")
             settings.save()
             self.notification = Notification("Settings Saved")
             self.set_menu("main")
             self.button_states.clear()
         elif idx == 1: #Default
             if self._settings['logging'].v:
-                print("H:Settings Default All")
+                print("XY:Settings Default All")
             for s in self._settings:
                 self._settings[s].v = self._settings[s].d
                 self._settings[s].persist()
@@ -2010,7 +2013,7 @@ class XYStageApp(app.App):
                 if self._auto_repeat_level < (_AUTO_REPEAT_SPEED_LEVEL_MAX if speed_up else _AUTO_REPEAT_LEVEL_MAX):
                     self._auto_repeat_level += 1
                     if self._settings['logging'].v:
-                        print(f"Auto Repeat Level: {self._auto_repeat_level}")
+                        print(f"XY:Auto Repeat Level: {self._auto_repeat_level}")
 
             return True
         return False
@@ -2698,7 +2701,7 @@ class MySetting:
             if v > self._max:
                 v = self._max  
         elif self._container['logging'].v:
-            print(f"H:inc type: {type(self.v)}")                               
+            print(f"XY:inc type: {type(self.v)}")                               
         return v
 
     # This returns a decrease in the value passed in - subject to min and with scale of increase depending on level
@@ -2722,7 +2725,7 @@ class MySetting:
             if v < self._min:
                 v = self._min
         elif self._container['logging'].v:
-            print(f"H: dec type: {type(self.v)}") 
+            print(f"XY: dec type: {type(self.v)}") 
         return v
     
 
@@ -2734,7 +2737,7 @@ class MySetting:
             else:
                 settings.set(f"xystage.{self._index()}", None)
         except Exception as e:
-            print(f"H:Failed to persist setting {self._index()}: {e}")
+            print(f"XY:Failed to persist setting {self._index()}: {e}")
 
 
 def parse_version(version):
