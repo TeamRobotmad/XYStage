@@ -126,10 +126,10 @@ Y_ENDSTOP = 1  # hs pin (HSG) - switch to ground
 Y_STEP = 2  # hs pin (HSH)
 
 # Joystick switch inputs on second hexpansion HS pins (active low)
-JOY_POS_X = 0  # HSF
-JOY_NEG_X = 1  # HSG
-JOY_POS_Y = 2  # HSH
-JOY_NEG_Y = 3  # HSI
+JOY_POS_X = 0  # HSF - Brown
+JOY_NEG_X = 1  # HSG - Red
+JOY_POS_Y = 2  # HSH - Orange
+JOY_NEG_Y = 3  # HSI - Yellow
 
 _MICRO_STEPS = 32  # We are using DRV8825 configured for 1/32 microstepping
 
@@ -802,7 +802,7 @@ class XYStageApp(app.App):
 
         valid = {
             "G0", "G1", "G4", "G28", "G90", "G91", "G92",
-            "M0", "M1", "M17", "M18", "M112", "M114", "M203", "M204", "M400"
+            "M0", "M1", "M17", "M18", "M47", "M112", "M114", "M203", "M204", "M400"
         }
         if cmd not in valid:
             raise ValueError(f"L{line_num}: unsupported {cmd}")
@@ -819,6 +819,7 @@ class XYStageApp(app.App):
             "M1": set(),
             "M17": set(),
             "M18": set(),
+            "M47": set(),
             "M112": set(),
             "M114": set(),
             "M203": {'X', 'Y'},
@@ -1280,6 +1281,10 @@ class XYStageApp(app.App):
             self._stepperX.enable(False)
             self._stepperY.enable(False)
             self._complete_current_gcode_step()
+        elif c == 'M47':        # Loop
+            self._log_gcode("M47 loop")
+            self._complete_current_gcode_step()
+            self._gcode_current_index = 0
         elif c == 'M112':       # Emergency stop
             self._stepperX.stop()
             self._stepperY.stop()
@@ -1347,10 +1352,12 @@ class XYStageApp(app.App):
 
         if self._gcode_wait_button:
             # Keep decelerating to zero while waiting for user input.
+            #Any Joystick movement or button press will continue the replay.
             self._stepperX.speed(0)
             self._stepperY.speed(0)
             self._set_led_mode(LED_MODE_INPUT)
-            if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+            joystick = self._read_joystick_inputs()
+            if self.button_states.get(BUTTON_TYPES["CONFIRM"]) or joystick['+x'] or joystick['+y'] or joystick['-x'] or joystick['-y']:
                 self.button_states.clear()
                 self._gcode_wait_button = False
                 self._complete_current_gcode_step()
@@ -1712,7 +1719,7 @@ class XYStageApp(app.App):
             ctx.rgb(0,0,0).rectangle(-120,-120,240,240).fill()
             # Main screen content 
             if   self.current_state == STATE_WARNING:
-                self.draw_message(ctx, ["XYStage requires","a custom","Motor Driver","hexpansion"], [(1,1,1),(1,1,0),(1,1,0),(1,1,0)], label_font_size)
+                self.draw_message(ctx, ["XYStage requires","a custom","Stepper Motor","hexpansion"], [(1,1,1),(1,1,0),(1,1,0),(1,1,0)], label_font_size)
             elif self.current_state == STATE_ERROR:
                 self.draw_message(ctx, self.error_message, [(1,0,0)]*len(self.error_message), label_font_size)
             elif self.current_state == STATE_MESSAGE:
